@@ -14,6 +14,20 @@ Die frühere Draufsicht-Fassung liegt unverändert in
 [2d-version/index.html](2d-version/index.html) (2D-Canvas, kein WebGL2 nötig) —
 praktisch als Vergleich, was die dritte Achse am Spielgefühl ändert.
 
+## Herunterladen (fertige Windows-App)
+
+Im [Release v1.0.0](https://github.com/TTTBubbleICE/rocketleague-vibecode/releases/latest)
+liegen zwei Dateien:
+
+| Datei | Was es ist |
+|---|---|
+| `Puck.Rocket.1.0.0.exe` | **portabel** — doppelklicken, nichts installieren |
+| `Puck.Rocket.Setup.1.0.0.exe` | **Installer** — Verknüpfungen im Startmenü/Desktop, Deinstallation über Windows |
+
+Windows 64 Bit, **Node.js ist dafür nicht nötig** (Electron und das Spiel stecken in
+der Datei). Die Dateien sind **nicht signiert**, Windows Smartscreen meldet deshalb
+beim ersten Start eine Warnung: *Weitere Informationen → Trotzdem ausführen*.
+
 ## Sofort spielen (ohne Installation)
 
 Doppelklick auf [index.html](index.html) — läuft in jedem modernen Browser
@@ -118,41 +132,35 @@ README.md                 diese Datei
 Alle Spielwerte liegen kommentiert im `CFG`-Block am Anfang von `index.html`
 (Fahrwerk, Boost, Flip, Sprung, Puck, Pads, Matchdauer).
 
-## Optional: eine `.exe` bauen
+## Selbst eine `.exe` bauen
 
-Nicht in `package.json` vorbereitet (das würde die Installation unnötig groß
-machen) — bei Bedarf:
-
-```bash
-npm install --save-dev electron-builder
-npx electron-builder --win
-```
-
-Dann noch in `package.json` ergänzen:
-
-```json
-"build": {
-  "appId": "com.puckrocket.arena",
-  "productName": "Puck Rocket",
-  "directories": { "output": "dist" },
-  "win": { "target": ["nsis", "portable"] }
-}
-```
-
-Das Ergebnis liegt in `dist/` (bereits in `.gitignore`). Für Releases auf GitHub
-lohnt es, `dist/` **nicht** mit zu committen, sondern die Datei als
-Release-Anhang hochzuladen.
-
-## Auf GitHub hochladen
+Die Build-Konfiguration steht in [package.json](package.json) (`build`), Voraussetzung
+ist [Node.js](https://nodejs.org) 18 oder neuer:
 
 ```bash
-git init
+npm install
+npm run dist            # Installer + portable .exe
+npm run dist:portable   # nur die portable .exe
+```
+
+Ergebnis in `dist/`: `Puck Rocket Setup 1.0.0.exe` (Installer) und
+`Puck Rocket 1.0.0.exe` (portabel, läuft ohne Installation). `dist/` ist über
+[.gitignore](.gitignore) ausgenommen — für ein Release die Datei als Anhang
+hochladen, nicht committen.
+
+Ein eigenes **Icon** ist nicht gesetzt (es erscheint das Electron-Standardicon):
+einfach ein `build/icon.ico` (256×256, enthält ICO) ablegen, electron-builder nimmt
+es automatisch. Ohne Signaturzertifikat bleiben die Dateien unsigniert — Windows
+zeigt deshalb die Smartscreen-Warnung.
+
+## Änderungen hochladen
+
+Das Repo liegt schon auf GitHub (`origin`), es fehlt also nur der Push:
+
+```bash
 git add .
-git commit -m "Puck Rocket — Mini Arena 3D als Desktop-App"
-# Repo auf github.com anlegen, dann:
-git remote add origin https://github.com/<dein-name>/puck-rocket-mini-arena.git
-git branch -M main
-git push -u origin main
+git commit -m "Beschreibung der Änderung"
+git push
 ```
 
 * `node_modules/`, `dist/` und Logs sind über [.gitignore](.gitignore) ausgenommen.

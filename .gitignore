@@ -1,6 +1,9 @@
 # Abhängigkeiten
 node_modules/
 
+# portable Werkzeug-Laufzeit (nur zum Bauen der .exe, gehört nicht ins Repo)
+.tools/
+
 # Build-Artefakte (electron-builder)
 dist/
 out/

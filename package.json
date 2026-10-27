@@ -8,10 +8,42 @@
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "dev": "electron ."
+    "dev": "electron .",
+    "dist": "electron-builder --win",
+    "dist:portable": "electron-builder --win portable"
   },
   "devDependencies": {
-    "electron": "^33.0.0"
+    "electron": "^33.0.0",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "com.puckrocket.arena",
+    "productName": "Puck Rocket",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "index.html",
+      "2d-version/**/*",
+      "main.js",
+      "package.json",
+      "README.md",
+      "REVERSE-ENGINEERING.md"
+    ],
+    "asar": false,
+    "win": {
+      "target": [
+        { "target": "nsis", "arch": ["x64"] },
+        { "target": "portable", "arch": ["x64"] }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Puck Rocket"
+    }
   },
   "engines": {
     "node": ">=18.0.0"
