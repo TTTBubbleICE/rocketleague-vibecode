@@ -1,0 +1,14 @@
+# Abhängigkeiten
+node_modules/
+
+# Build-Artefakte (electron-builder)
+dist/
+out/
+
+# Laufzeit-Logs
+*.log
+
+# Betriebssystem-Kram
+.DS_Store
+Thumbs.db
+desktop.ini

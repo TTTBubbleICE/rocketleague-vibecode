@@ -1,0 +1,28 @@
+{
+  "name": "puck-rocket-mini-arena",
+  "productName": "Puck Rocket",
+  "version": "1.0.0",
+  "description": "3D-Minispiel aus Puck und Rocket League: 1 gegen 1 gegen einen Bot, mit Sprung, Flip und Aerials in einer handgeschriebenen WebGL2-Arena. Das Spiel selbst ist eine einzige HTML-Datei ohne Laufzeit-Abhängigkeiten.",
+  "private": true,
+  "author": "TTTBubbleICE",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^33.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "electron",
+    "game",
+    "minigame",
+    "rocket-league",
+    "puck",
+    "webgl2",
+    "3d"
+  ]
+}

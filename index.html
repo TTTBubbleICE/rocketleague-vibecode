@@ -1,0 +1,1833 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PUCK ROCKET — Mini Arena 3D</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='13' fill='%23223048' stroke='%23cfe2ff' stroke-width='3'/><circle cx='16' cy='16' r='5' fill='%2390b8ff'/></svg>">
+<style>
+  :root { --bg: #04060d; }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%; background: var(--bg); color: #cfe0f5;
+    font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+    overflow: hidden;
+  }
+  #stage { position: fixed; inset: 0; }
+  #stage canvas { position: absolute; inset: 0; display: block; width: 100%; height: 100%; }
+  #hud { pointer-events: none; }
+  #hint {
+    position: fixed; left: 50%; bottom: 6px; transform: translateX(-50%);
+    margin: 0; font-size: 12px; letter-spacing: .04em; opacity: .45;
+    white-space: nowrap; pointer-events: none;
+  }
+  #fail {
+    position: fixed; inset: 0; display: none; place-items: center; text-align: center;
+    padding: 2rem; font-size: 15px; line-height: 1.6;
+  }
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="gl"></canvas>
+  <canvas id="hud"></canvas>
+</div>
+<p id="hint">WASD fahren &middot; LEERTASTE Sprung &amp; Flip &middot; SHIFT Boost &middot; CTRL Drift &middot; C Kamera &middot; P Pause &middot; R Revanche &middot; M Ton</p>
+<div id="fail"></div>
+
+<script>
+'use strict';
+/* =====================================================================
+   PUCK ROCKET — Mini Arena 3D
+   Pseudo-3D gibt es hier nicht: die Arena ist echte 3D-Geometrie, gezeichnet
+   mit handgeschriebenem WebGL2 (kein three.js, keine Assets, keine
+   Abhängigkeiten). Dazu echte Höhe: Puck fliegt und springt, Autos springen,
+   flippen und fliegen mit Boost (Aerial).
+   Herleitung der Mechanik: REVERSE-ENGINEERING.md
+   ===================================================================== */
+
+/* ---------------------------------------------------------------
+   1) TUNING — das "Reverse Engineering" in Zahlen
+   --------------------------------------------------------------- */
+const CFG = {
+  field: { w: 1600, d: 900 },                          // Länge (x) und Breite (z)
+  goal:  { depth: 165, mouth: 320, bar: 250 },         // Tiefe, Öffnungsbreite, Lattenhöhe
+  arena: { wall: 560, ceil: 560 },                     // Wand- und Deckenhoehe
+
+  car: {
+    len: 72, wid: 44, hei: 32,                         // Karosserie (Optik + Trefferbox)
+    accel: 1500, reverseAccel: 900, brake: 2200,
+    maxSpeed: 900, boostMax: 1500, reverseMax: 420,
+    coastDrag: 380, overspeed: 1.1,
+    steerRate: 4.2, steerRef: 260, steerFalloff: 0.35, airSteer: 0.8,
+    grip: 7.5, gripDrift: 1.7, airDrag: 0.5,
+    gravity: 2600, jumpImpulse: 900, airLift: 3400,
+    boostCap: 100, boostUse: 33.3, boostAccel: 2300,
+    dodgeSpeed: 1120, dodgeTime: 0.55, dodgeCooldown: 1.3, flipDrag: 1.2,
+    flipBlend: 0.8, flipBlendBack: 0.5, flipHit: 1200,
+    hitRest: 0.55, puckMass: 0.34, carRecoil: 0.22,
+    demoSpeed: 1200, demoRespawn: 2.0, spawnProtect: 1.6,
+    wallBounce: 0.35, wallRadius: 34
+  },
+
+  puck: {
+    r: 46, gravity: 1900, airDrag: 0.25,
+    rollFriction: 0.55, rollDrag: 45,
+    wallRest: 0.8, floorRest: 0.62, ceilRest: 0.5, maxSpeed: 2400
+  },
+
+  pad: { small: { boost: 12, respawn: 4 }, big: { boost: 100, respawn: 10 } },
+  match: { time: 300, kickoff: 3, goalPause: 2.6, kickoffBoost: 34 }
+};
+
+/* Boost-Pads: dieselbe Aufstellung wie in der 2D-Fassung (x/z-Spiegelung) */
+const PAD_LAYOUT = [
+  { x: -640, z: -330, big: true }, { x: -640, z: 330, big: true },
+  { x:  640, z: -330, big: true }, { x:  640, z: 330, big: true },
+  { x: -230, z: -380, big: true }, { x: -230, z: 380, big: true },
+  { x:  230, z: -380, big: true }, { x:  230, z: 380, big: true },
+  { x: -430, z: -180 }, { x: -430, z: 180 }, { x: 430, z: -180 }, { x: 430, z: 180 },
+  { x: -160, z: -320 }, { x: -160, z: 320 }, { x: 160, z: -320 }, { x: 160, z: 320 }
+];
+
+/* ---------------------------------------------------------------
+   2) Helfer (Skalar + Matrizen)
+   --------------------------------------------------------------- */
+const TAU = Math.PI * 2;
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const rand = (a, b) => a + Math.random() * (b - a);
+const hypot = (x, y) => Math.sqrt(x * x + y * y);
+function wrapAngle(a) { a %= TAU; if (a > Math.PI) a -= TAU; if (a < -Math.PI) a += TAU; return a; }
+
+/* Matrix-3x3 einer Drehung (Spalten = Bilder der Basisvektoren):
+   R = Ry(yaw) * Rz(pitch) * Rx(roll) */
+const _rot = new Float32Array(9);
+function rot3(yaw, pitch, roll) {
+  const cy = Math.cos(yaw), sy = Math.sin(yaw);
+  const cp = Math.cos(pitch), sp = Math.sin(pitch);
+  const cr = Math.cos(roll), sr = Math.sin(roll);
+  const ex = [1, 0, 0], ey = [0, 1, 0], ez = [0, 0, 1];
+  const out = _rot;
+  [ex, ey, ez].forEach((v, i) => {
+    // erst Roll um x, dann Pitch um z, dann Yaw um y
+    let x = v[0], y = v[1], z = v[2];
+    let t = y * cr - z * sr; z = y * sr + z * cr; y = t;            // Rx
+    t = x * cp - y * sp; y = x * sp + y * cp; x = t;                // Rz
+    t = x * cy + z * sy; z = -x * sy + z * cy; x = t;               // Ry
+    out[i * 3] = x; out[i * 3 + 1] = y; out[i * 3 + 2] = z;
+  });
+  return out;
+}
+
+const _model = new Float32Array(16);
+function m4compose(tx, ty, tz, yaw, pitch, roll, sx, sy, sz) {
+  const r = rot3(yaw, pitch, roll), o = _model;
+  o[0] = r[0] * sx; o[1] = r[1] * sx; o[2] = r[2] * sx; o[3] = 0;
+  o[4] = r[3] * sy; o[5] = r[4] * sy; o[6] = r[5] * sy; o[7] = 0;
+  o[8] = r[6] * sz; o[9] = r[7] * sz; o[10] = r[8] * sz; o[11] = 0;
+  o[12] = tx; o[13] = ty; o[14] = tz; o[15] = 1;
+  return o;
+}
+/* Normalenmatrix = R * S^-1 (für R*S exakt) */
+const _norm = new Float32Array(9);
+function n3compose(yaw, pitch, roll, sx, sy, sz) {
+  const r = rot3(yaw, pitch, roll), o = _norm;
+  o[0] = r[0] / sx; o[1] = r[1] / sx; o[2] = r[2] / sx;
+  o[3] = r[3] / sy; o[4] = r[4] / sy; o[5] = r[5] / sy;
+  o[6] = r[6] / sz; o[7] = r[7] / sz; o[8] = r[8] / sz;
+  return o;
+}
+function m4perspective(out, fovy, aspect, near, far) {
+  const f = 1 / Math.tan(fovy / 2);
+  out.fill(0);
+  out[0] = f / aspect; out[5] = f; out[11] = -1;
+  out[10] = (far + near) / (near - far);
+  out[14] = (2 * far * near) / (near - far);
+  return out;
+}
+function m4lookAt(out, ex, ey, ez, cx, cy, cz) {
+  let zx = ex - cx, zy = ey - cy, zz = ez - cz;
+  let l = hypot(zx, zz), t = Math.sqrt(l * l + zy * zy) || 1;
+  zx /= t; zy /= t; zz /= t;
+  /* up = (0,1,0) */
+  let xx = 1 * zz - 0 * zy, xy = 0 * zx - 0 * zz, xz = 0 * zy - 1 * zx;
+  l = Math.sqrt(xx * xx + xy * xy + xz * xz) || 1;
+  xx /= l; xy /= l; xz /= l;
+  const yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+  out[0] = xx; out[1] = yx; out[2] = zx; out[3] = 0;
+  out[4] = xy; out[5] = yy; out[6] = zy; out[7] = 0;
+  out[8] = xz; out[9] = yz; out[10] = zz; out[11] = 0;
+  out[12] = -(xx * ex + xy * ey + xz * ez);
+  out[13] = -(yx * ex + yy * ey + yz * ez);
+  out[14] = -(zx * ex + zy * ey + zz * ez);
+  out[15] = 1;
+  return out;
+}
+function m4mul(out, a, b) {
+  for (let i = 0; i < 4; i++) {
+    const b0 = b[i * 4], b1 = b[i * 4 + 1], b2 = b[i * 4 + 2], b3 = b[i * 4 + 3];
+    out[i * 4]     = a[0] * b0 + a[4] * b1 + a[8] * b2 + a[12] * b3;
+    out[i * 4 + 1] = a[1] * b0 + a[5] * b1 + a[9] * b2 + a[13] * b3;
+    out[i * 4 + 2] = a[2] * b0 + a[6] * b1 + a[10] * b2 + a[14] * b3;
+    out[i * 4 + 3] = a[3] * b0 + a[7] * b1 + a[11] * b2 + a[15] * b3;
+  }
+  return out;
+}
+
+/* ---------------------------------------------------------------
+   3) Welt
+   --------------------------------------------------------------- */
+const FIELD = CFG.field;
+const HX = FIELD.w / 2, HZ = FIELD.d / 2;
+const NO_INPUT = { throttle: 0, steer: 0, boost: false, handbrake: false, jump: false };
+
+const G = {
+  cars: [], puck: null, pads: [], particles: [],
+  match: { state: 'menu', clock: CFG.match.time, blue: 0, orange: 0, overtime: false,
+           kickoffTimer: 0, goalTimer: 0, scorer: null, message: '', msgTimer: 0, paused: false },
+  shake: 0, hitFlash: 0, t: 0, slowmo: 0
+};
+
+function makePad(p) {
+  const spec = p.big ? CFG.pad.big : CFG.pad.small;
+  return { x: p.x, z: p.z, big: !!p.big, boost: spec.boost, respawn: spec.respawn, timer: 0 };
+}
+
+function makeCar(team, isBot) {
+  return {
+    team, isBot,
+    pos: { x: 0, y: 0, z: 0 }, vel: { x: 0, y: 0, z: 0 },
+    heading: team === 'blue' ? 0 : Math.PI,
+    tilt: 0, roll3: 0,                                    // nur Optik (Flip-Rotation)
+    boost: CFG.match.kickoffBoost, boosting: false,
+    flipTimer: 0, dodgeCd: 0, flipReady: false, jumps: 0, grounded: true, flipLateral: false,
+    handbrake: false, speed: 0,
+    dead: false, deadTimer: 0, protect: 0,
+    demos: 0, goals: 0, jumpQueued: false,
+    ai: { t: 0, noise: 0, mode: 'attack', side: 0, hinten: false, bedrohung: false }
+  };
+}
+
+function newMatch() {
+  G.match = { state: 'kickoff', clock: CFG.match.time, blue: 0, orange: 0, overtime: false,
+              kickoffTimer: CFG.match.kickoff, goalTimer: 0, scorer: null,
+              message: '', msgTimer: 0, paused: false };
+  G.cars = [makeCar('blue', false), makeCar('orange', true)];
+  G.puck = { pos: { x: 0, y: CFG.puck.r, z: 0 }, vel: { x: 0, y: 0, z: 0 }, roll: 0, spin: 0 };
+  G.pads = PAD_LAYOUT.map(makePad);
+  G.particles = []; G.shake = 0; G.hitFlash = 0;
+  setupKickoff();
+}
+
+function setupKickoff() {
+  const b = G.cars[0], o = G.cars[1];
+  b.pos.x = -FIELD.w * 0.23; b.pos.z = 0; b.heading = 0;
+  o.pos.x =  FIELD.w * 0.23; o.pos.z = 0; o.heading = Math.PI;
+  for (const c of G.cars) {
+    c.pos.y = 0; c.vel.x = 0; c.vel.y = 0; c.vel.z = 0;
+    c.boost = CFG.match.kickoffBoost;
+    c.flipTimer = 0; c.flipReady = false; c.jumps = 0; c.dodgeCd = 0;
+    c.boosting = false; c.dead = false; c.deadTimer = 0; c.speed = 0;
+    c.tilt = 0; c.roll3 = 0; c.grounded = true;
+  }
+  const p = G.puck;
+  p.pos.x = 0; p.pos.y = CFG.puck.r; p.pos.z = 0;
+  p.vel.x = 0; p.vel.y = 0; p.vel.z = 0;
+  G.match.kickoffTimer = CFG.match.kickoff;
+  G.match.state = 'kickoff';
+  G.match.scorer = null;
+  G.match.message = G.match.overtime ? 'OVERTIME — GOLDEN GOAL' : '';
+}
+
+/* ---------------------------------------------------------------
+   4) Fahrzeug-Physik — inkl. Höhenachse (Sprung, Flip, Aerial)
+   --------------------------------------------------------------- */
+function startFlip(car, inp) {
+  /* Richtung: Stick-Eingabe wie im Original, oder fest vorgegeben (Bot/Aerial) */
+  let dx, dy, dz, back = false;
+  if (inp.flipDir) {
+    const l = Math.sqrt(inp.flipDir.x ** 2 + inp.flipDir.y ** 2 + inp.flipDir.z ** 2) || 1;
+    dx = inp.flipDir.x / l; dy = inp.flipDir.y / l; dz = inp.flipDir.z / l;
+  } else {
+    back = inp.throttle < 0;
+    let ang = car.heading;
+    if (back) ang = car.heading + Math.PI;
+    else if (inp.steer < 0) ang = car.heading - Math.PI / 2;
+    else if (inp.steer > 0) ang = car.heading + Math.PI / 2;
+    dx = Math.cos(ang); dy = 0; dz = Math.sin(ang);
+  }
+  const blend = back ? CFG.car.flipBlendBack : CFG.car.flipBlend;
+  const sp = CFG.car.dodgeSpeed;
+  car.vel.x = car.vel.x * (1 - blend) + dx * sp * blend;
+  car.vel.z = car.vel.z * (1 - blend) + dz * sp * blend;
+  if (dy > 0.05) car.vel.y = sp * dy * 0.9;                    // Aerial: nach oben
+  else car.vel.y = Math.max(car.vel.y, 0);
+  car.flipTimer = CFG.car.dodgeTime;
+  car.dodgeCd = CFG.car.dodgeCooldown;
+  /* Optik: vorwärts/rückwärts = Nicken, seitlich = Wälzen */
+  const lateral = Math.abs(dx * -Math.sin(car.heading) + dz * Math.cos(car.heading));
+  car.flipLateral = lateral > 0.7;
+  car.tilt = dy > 0.05 ? 0 : (back ? -1 : 1);
+  fx({ kind: 'dust', x: car.pos.x, y: car.pos.y + 6, z: car.pos.z, n: 6, color: car.team });
+}
+
+function stepCar(car, inp, dt) {
+  if (car.dead) {
+    car.deadTimer -= dt;
+    if (car.deadTimer <= 0) respawnCar(car);
+    return;
+  }
+  car.protect = Math.max(0, car.protect - dt);
+  car.dodgeCd = Math.max(0, car.dodgeCd - dt);
+  car.handbrake = inp.handbrake;
+
+  const fx0 = Math.cos(car.heading), fz0 = Math.sin(car.heading);
+  const wasGrounded = car.pos.y <= 0.02;
+  const flipping = car.flipTimer > 0;
+  car.boosting = false;
+
+  if (flipping) {
+    /* Während des Flips: keine Eingaben, Impuls klingt ab */
+    car.flipTimer -= dt;
+    const k = Math.max(0, 1 - CFG.car.flipDrag * dt);
+    car.vel.x *= k; car.vel.z *= k;
+    car.tilt = Math.min(1, car.tilt + dt * 3);
+  } else if (wasGrounded) {
+    let vf = car.vel.x * fx0 + car.vel.z * fz0;            // Längsgeschwindigkeit
+    let a = 0;
+    if (inp.throttle > 0) a = CFG.car.accel * Math.max(0, 1 - vf / CFG.car.maxSpeed);
+    else if (inp.throttle < 0) {
+      a = vf > 20 ? -CFG.car.brake
+                  : -CFG.car.reverseAccel * Math.max(0, 1 - (-vf) / CFG.car.reverseMax);
+    }
+    if (inp.boost && car.boost > 0.5) {
+      car.boosting = true;
+      car.boost = Math.max(0, car.boost - CFG.car.boostUse * dt);
+      a += CFG.car.boostAccel * Math.max(0, 1 - vf / CFG.car.boostMax);
+    }
+    car.vel.x += fx0 * a * dt;
+    car.vel.z += fz0 * a * dt;
+    if (inp.throttle === 0 && !car.boosting) {             // Rollwiderstand
+      vf = car.vel.x * fx0 + car.vel.z * fz0;
+      const d = CFG.car.coastDrag * dt;
+      const nv = Math.abs(vf) <= d ? 0 : vf - Math.sign(vf) * d;
+      car.vel.x += fx0 * (nv - vf);
+      car.vel.z += fz0 * (nv - vf);
+    }
+  } else if (inp.boost && car.boost > 0.5) {
+    /* In der Luft hebt Boost an — so funktionieren Aerials */
+    car.boosting = true;
+    car.boost = Math.max(0, car.boost - CFG.car.boostUse * dt);
+    car.vel.x += fx0 * CFG.car.boostAccel * 0.8 * dt;
+    car.vel.z += fz0 * CFG.car.boostAccel * 0.8 * dt;
+    car.vel.y += CFG.car.airLift * dt;
+  }
+
+  /* Sprung / Flip: erster Druck springt, zweiter (in der Luft) flippt.
+     inp.flip ist der direkte Boden-Flip ohne Sprung — die Bot-KI nutzt ihn als
+     harten Schuss. Ein Sprung taugt dafür nicht: er hebt das Auto über den
+     flachen Puck (Oberkante 92 gegen Sprunghöhe 152) hinweg. */
+  if (inp.flip && wasGrounded && car.dodgeCd <= 0 && !flipping) {
+    startFlip(car, inp);
+  } else if (inp.jump) {
+    if (wasGrounded) {
+      car.vel.y = CFG.car.jumpImpulse;
+      car.flipReady = true;
+      car.jumps = 1;
+      fx({ kind: 'dust', x: car.pos.x, y: 4, z: car.pos.z, n: 8, color: car.team });
+    } else if (car.flipReady && !flipping) {
+      startFlip(car, inp);
+      car.flipReady = false;
+    }
+  }
+
+  /* Lenkung: am Boden wie gehabt, in der Luft nur Giermoment */
+  const vfNow = car.vel.x * fx0 + car.vel.z * fz0;
+  if (!flipping) {
+    let rate;
+    if (wasGrounded) {
+      const sp = Math.abs(vfNow);
+      const gate = clamp(sp / CFG.car.steerRef, 0, 1);
+      const fall = 1 - CFG.car.steerFalloff * clamp(sp / CFG.car.boostMax, 0, 1);
+      rate = CFG.car.steerRate * fall * gate * (vfNow < -20 ? -1 : 1);
+    } else {
+      rate = CFG.car.steerRate * CFG.car.airSteer;
+    }
+    car.heading = wrapAngle(car.heading + inp.steer * rate * dt);
+  }
+
+  /* Querachse: Grip am Boden, Drift mit Handbremse, Luftwiderstand in der Luft */
+  const nx = Math.cos(car.heading), nz = Math.sin(car.heading);
+  const nrx = -nz, nrz = nx;
+  let nl = car.vel.x * nx + car.vel.z * nz;
+  let nq = car.vel.x * nrx + car.vel.z * nrz;
+  let gripRate;
+  if (flipping) gripRate = 1.2;
+  else if (wasGrounded) gripRate = inp.handbrake ? CFG.car.gripDrift : CFG.car.grip;
+  else gripRate = CFG.car.airDrag;
+  nq *= Math.max(0, 1 - gripRate * dt);
+  car.vel.x = nx * nl + nrx * nq;
+  car.vel.z = nz * nl + nrz * nq;
+
+  /* Überschwindigkeit (Flip/Impulse) sanft abbauen */
+  const spXZ = hypot(car.vel.x, car.vel.z);
+  if (spXZ > CFG.car.boostMax) {
+    const k = Math.max(0, 1 - CFG.car.overspeed * dt);
+    car.vel.x *= k; car.vel.z *= k;
+  }
+  car.speed = spXZ;
+
+  /* Höhe */
+  car.vel.y -= CFG.car.gravity * dt;
+  car.pos.x += car.vel.x * dt;
+  car.pos.z += car.vel.z * dt;
+  car.pos.y += car.vel.y * dt;
+  if (car.pos.y <= 0) {
+    car.pos.y = 0;
+    if (car.vel.y < 0) car.vel.y = 0;
+    car.jumps = 0; car.flipReady = false;
+    if (car.flipTimer > 0 && car.tilt > 0.6) car.flipTimer = Math.min(car.flipTimer, 0.1);
+    car.tilt = Math.max(0, car.tilt - dt * 4);
+  } else {
+    car.tilt = Math.max(0, car.tilt - dt * 0.7);
+  }
+  const ceilY = CFG.arena.ceil - CFG.car.hei;
+  if (car.pos.y > ceilY) { car.pos.y = ceilY; if (car.vel.y > 0) car.vel.y = 0; }
+  car.grounded = car.pos.y <= 0.02;
+  car.roll3 = car.tilt * 0.55 * (car.flipTimer > 0 ? car.flipTimer / CFG.car.dodgeTime : 0);
+
+  collideCarWalls(car);
+}
+
+function collideCarWalls(car) {
+  const r = CFG.car.wallRadius, e = CFG.car.wallBounce;
+  if (car.pos.z - r < -HZ) { car.pos.z = -HZ + r; if (car.vel.z < 0) car.vel.z = -car.vel.z * e; car.vel.x *= 0.94; }
+  if (car.pos.z + r >  HZ) { car.pos.z =  HZ - r; if (car.vel.z > 0) car.vel.z = -car.vel.z * e; car.vel.x *= 0.94; }
+  const inMouth = Math.abs(car.pos.z) < CFG.goal.mouth / 2 - r * 0.4;
+  if (car.pos.x - r < -HX && !inMouth) { car.pos.x = -HX + r; if (car.vel.x < 0) car.vel.x = -car.vel.x * e; car.vel.z *= 0.94; }
+  if (car.pos.x + r >  HX && !inMouth) { car.pos.x =  HX - r; if (car.vel.x > 0) car.vel.x = -car.vel.x * e; car.vel.z *= 0.94; }
+  const bx = inMouth ? HX + CFG.goal.depth - r : HX - r;
+  car.pos.x = clamp(car.pos.x, -bx, bx);
+}
+
+function respawnCar(car) {
+  const sign = car.team === 'blue' ? -1 : 1;
+  car.pos.x = sign * FIELD.w * 0.23; car.pos.y = 0; car.pos.z = 0;
+  car.heading = car.team === 'blue' ? 0 : Math.PI;
+  car.vel.x = 0; car.vel.y = 0; car.vel.z = 0;
+  car.dead = false; car.deadTimer = 0;
+  car.flipTimer = 0; car.flipReady = false; car.dodgeCd = 0.8; car.tilt = 0; car.roll3 = 0;
+  car.boost = 0; car.boosting = false;
+  car.protect = CFG.car.spawnProtect;
+  fx({ kind: 'ring', x: car.pos.x, y: 2, z: car.pos.z, n: 1, color: car.team });
+}
+
+/* ---------------------------------------------------------------
+   5) Puck — Kugel mit Höhe (der "Puck"-Teil: schwer, gleitet weit)
+   --------------------------------------------------------------- */
+function stepPuck(p, dt) {
+  const spXZ = hypot(p.vel.x, p.vel.z);
+  const onFloor = p.pos.y <= CFG.puck.r + 0.5;
+
+  if (onFloor) {
+    if (spXZ > 0) {
+      const dec = (CFG.puck.rollFriction * spXZ + CFG.puck.rollDrag) * dt;
+      const ns = Math.max(0, spXZ - dec);
+      p.vel.x *= ns / spXZ; p.vel.z *= ns / spXZ;
+    }
+  } else {
+    const k = Math.max(0, 1 - CFG.puck.airDrag * dt);
+    p.vel.x *= k; p.vel.z *= k;
+  }
+  if (spXZ > CFG.puck.maxSpeed) { p.vel.x *= CFG.puck.maxSpeed / spXZ; p.vel.z *= CFG.puck.maxSpeed / spXZ; }
+
+  p.vel.y -= CFG.puck.gravity * dt;
+  p.pos.x += p.vel.x * dt;
+  p.pos.y += p.vel.y * dt;
+  p.pos.z += p.vel.z * dt;
+  p.roll += (spXZ / CFG.puck.r) * dt * 0.6;
+  p.spin *= Math.max(0, 1 - 1.2 * dt);
+
+  const r = CFG.puck.r;
+  /* Boden */
+  if (p.pos.y < r) {
+    p.pos.y = r;
+    if (p.vel.y < 0) {
+      p.vel.y = -p.vel.y * CFG.puck.floorRest;
+      if (Math.abs(p.vel.y) < 45) p.vel.y = 0;
+    }
+  }
+  /* Decke */
+  const ceilY = CFG.arena.ceil - r;
+  if (p.pos.y > ceilY) { p.pos.y = ceilY; if (p.vel.y > 0) p.vel.y = -p.vel.y * CFG.puck.ceilRest; }
+  /* Seitenwände */
+  if (p.pos.z - r < -HZ) { p.pos.z = -HZ + r; p.vel.z = Math.abs(p.vel.z) * CFG.puck.wallRest; puckWallFx(p); }
+  if (p.pos.z + r >  HZ) { p.pos.z =  HZ - r; p.vel.z = -Math.abs(p.vel.z) * CFG.puck.wallRest; puckWallFx(p); }
+
+  /* Stirnseiten: Toröffnung oder Bande */
+  const mouth = CFG.goal.mouth / 2;
+  const inGoal = Math.abs(p.pos.z) < mouth && p.pos.y < CFG.goal.bar;
+  if (p.pos.x - r < -HX) {
+    if (inGoal) {
+      const back = -HX - CFG.goal.depth + r;
+      if (p.pos.x < back) { p.pos.x = back; p.vel.x = Math.abs(p.vel.x) * 0.22; }
+      if (Math.abs(p.pos.z) + r > mouth) { p.pos.z = clamp(p.pos.z, -mouth + r, mouth - r); p.vel.z *= -0.4; }
+      if (p.pos.x + r < -HX && G.match.state === 'play') scoreGoal('orange');
+    } else {
+      p.pos.x = -HX + r; p.vel.x = Math.abs(p.vel.x) * CFG.puck.wallRest; puckWallFx(p);
+    }
+  } else if (p.pos.x + r > HX) {
+    if (inGoal) {
+      const back = HX + CFG.goal.depth - r;
+      if (p.pos.x > back) { p.pos.x = back; p.vel.x = -Math.abs(p.vel.x) * 0.22; }
+      if (Math.abs(p.pos.z) + r > mouth) { p.pos.z = clamp(p.pos.z, -mouth + r, mouth - r); p.vel.z *= -0.4; }
+      if (p.pos.x - r > HX && G.match.state === 'play') scoreGoal('blue');
+    } else {
+      p.pos.x = HX - r; p.vel.x = -Math.abs(p.vel.x) * CFG.puck.wallRest; puckWallFx(p);
+    }
+  }
+}
+
+function puckWallFx(p) {
+  if (Math.sqrt(p.vel.x ** 2 + p.vel.y ** 2 + p.vel.z ** 2) < 260) return;
+  fx({ kind: 'dust', x: p.pos.x, y: p.pos.y, z: p.pos.z, n: 5, color: 'puck' });
+}
+
+/* ---------------------------------------------------------------
+   6) Kollisionen
+   --------------------------------------------------------------- */
+function collideCars(a, b) {
+  const ay = a.pos.y + CFG.car.hei / 2, by = b.pos.y + CFG.car.hei / 2;
+  const dx = b.pos.x - a.pos.x, dy = by - ay, dz = b.pos.z - a.pos.z;
+  const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+  const min = CFG.car.wallRadius * 2;
+  if (d <= 0.0001 || d > min) return;
+  const nx = dx / d, ny = dy / d, nz = dz / d;
+  const push = (min - d) / 2;
+  a.pos.x -= nx * push; a.pos.z -= nz * push;
+  b.pos.x += nx * push; b.pos.z += nz * push;
+  const rel = (b.vel.x - a.vel.x) * nx + (b.vel.y - a.vel.y) * ny + (b.vel.z - a.vel.z) * nz;
+  if (rel < 0) {
+    const j = -(1 + 0.35) * rel / 2;
+    a.vel.x -= nx * j; a.vel.y -= ny * j; a.vel.z -= nz * j;
+    b.vel.x += nx * j; b.vel.y += ny * j; b.vel.z += nz * j;
+  }
+  if (a.protect <= 0 && b.protect <= 0 && !a.dead && !b.dead && a.team !== b.team) {
+    if (a.speed >= CFG.car.demoSpeed && a.speed > b.speed * 1.05) demolish(a, b);
+    else if (b.speed >= CFG.car.demoSpeed && b.speed > a.speed * 1.05) demolish(b, a);
+  }
+}
+
+function demolish(src, dst) {
+  dst.dead = true; dst.deadTimer = CFG.car.demoRespawn; dst.boost = 0;
+  dst.vel.x = 0; dst.vel.y = 0; dst.vel.z = 0;
+  src.demos++;
+  G.shake = 14; G.slowmo = 0.18;
+  Audio.demo();
+  fx({ kind: 'boom', x: dst.pos.x, y: dst.pos.y + 20, z: dst.pos.z, n: 34, color: dst.team });
+  G.match.message = 'DEMOLITION!';
+  G.match.msgTimer = 1.2;
+}
+
+/* Puck gegen Auto: Kugel gegen gedrehte Box (OBB) — ergibt auch Treffer von oben */
+function collidePuck(car, p) {
+  const hy = CFG.car.hei / 2;
+  const cx = car.pos.x, cy = car.pos.y + hy, cz = car.pos.z;
+  const dx = p.pos.x - cx, dy = p.pos.y - cy, dz = p.pos.z - cz;
+  const ch = Math.cos(car.heading), sh = Math.sin(car.heading);
+  /* Welt -> lokal (Rückdrehung um die Gierachse) */
+  const lx = dx * ch + dz * sh;
+  const lz = -dx * sh + dz * ch;
+  const ly = dy;
+  const ex = CFG.car.len / 2, ey = hy, ez = CFG.car.wid / 2;
+  const qx = clamp(lx, -ex, ex), qy = clamp(ly, -ey, ey), qz = clamp(lz, -ez, ez);
+  let nx = lx - qx, ny = ly - qy, nz = lz - qz;
+  let dist = Math.sqrt(nx * nx + ny * ny + nz * nz);
+  if (dist > CFG.puck.r) return;
+
+  if (dist < 1e-4) {
+    /* Mittelpunkt liegt in der Box: über die kleinste Eindringtiefe hinausschubsen */
+    const px = ex - Math.abs(lx), py = ey - Math.abs(ly), pz = ez - Math.abs(lz);
+    if (px <= py && px <= pz) { nx = Math.sign(lx) || 1; ny = 0; nz = 0; dist = -(px); }
+    else if (py <= pz) { nx = 0; ny = Math.sign(ly) || 1; nz = 0; dist = -(py); }
+    else { nx = 0; ny = 0; nz = Math.sign(lz) || 1; dist = -(pz); }
+    dist = 0;
+  } else {
+    nx /= dist; ny /= dist; nz /= dist;
+  }
+  const pen = CFG.puck.r - dist;
+
+  /* lokal -> Welt */
+  const wx = nx * ch - nz * sh;
+  const wz = nx * sh + nz * ch;
+  const wy = ny;
+  p.pos.x += wx * pen; p.pos.y += wy * pen; p.pos.z += wz * pen;
+
+  const close = (car.vel.x - p.vel.x) * wx + (car.vel.y - p.vel.y) * wy + (car.vel.z - p.vel.z) * wz;
+  if (close <= 0) return;
+
+  const flip = car.flipTimer > 0 ? car.flipTimer / CFG.car.dodgeTime : 0;
+  const mCar = 1, mPuck = CFG.car.puckMass;
+  const j = (1 + CFG.car.hitRest) * close / (1 / mCar + 1 / mPuck);
+  p.vel.x += wx * (j / mPuck);
+  p.vel.y += wy * (j / mPuck);
+  p.vel.z += wz * (j / mPuck);
+  if (flip > 0) {
+    p.vel.x += wx * CFG.car.flipHit * flip;
+    p.vel.y += wy * CFG.car.flipHit * flip;
+    p.vel.z += wz * CFG.car.flipHit * flip;
+  }
+  car.vel.x -= wx * (j / mCar) * CFG.car.carRecoil;
+  car.vel.y -= wy * (j / mCar) * CFG.car.carRecoil;
+  car.vel.z -= wz * (j / mCar) * CFG.car.carRecoil;
+
+  Audio.hit(close, flip > 0);
+  p.spin += close * 0.004 * (Math.random() < 0.5 ? -1 : 1);
+  G.hitFlash = Math.min(1, close / 1200);
+  G.shake = Math.max(G.shake, clamp(close / 160, 0, 9));
+  fx({ kind: 'spark', x: p.pos.x - wx * CFG.puck.r, y: p.pos.y - wy * CFG.puck.r, z: p.pos.z - wz * CFG.puck.r,
+       n: flip > 0 ? 14 : 6, color: flip > 0 ? 'flip' : car.team });
+}
+
+function collectPads(car) {
+  if (car.pos.y > 120) return;
+  for (const pad of G.pads) {
+    if (pad.timer > 0) continue;
+    if (hypot(car.pos.x - pad.x, car.pos.z - pad.z) > CFG.car.wallRadius + 36) continue;
+    if (pad.big && car.boost > CFG.car.boostCap - 1) continue;
+    car.boost = Math.min(CFG.car.boostCap, car.boost + pad.boost);
+    pad.timer = pad.respawn;
+    fx({ kind: 'ring', x: pad.x, y: 2, z: pad.z, n: 1, color: pad.big ? 'big' : 'small' });
+  }
+}
+
+/* ---------------------------------------------------------------
+   7) Bot-KI
+   Drei Regeln, die den Bot wie einen Spieler aussehen lassen:
+
+   1. Er stellt sich HINTER den Puck auf die Linie Puck -> Toreck und rollt dann
+      durch den Puck hindurch. Von dort zeigt jeder Kontakt aufs Tor; kurz vor
+      dem Puck setzt er den Boden-Flip als harten Schuss (Flip-Hit-Bonus).
+   2. Steht er falsch — zwischen Puck und gegnerischem Tor — kurvt er außen
+      herum, statt den Puck ins eigene Tor zu drücken.
+   3. Gesprungen wird nur, wenn der Puck in der Luft hängt. Ein Puck am Boden
+      wird rollend getroffen: die Sprunghöhe (152) liegt über dem Puck
+      (Oberkante 92), der Bot würde also über ihn hinwegfliegen.
+
+   Dazu: freies Toreck statt Tor-Mitte, Boost-Management und Tanken abseits des
+   Pucks. Das Anvisieren des Ziels wird alle 0,18 s neu bewertet (Trägheit),
+   die Schussseite über eine Hysterese — sonst zappelt die KI.
+   --------------------------------------------------------------- */
+function botInput(car, dt) {
+  const p = G.puck;
+  const a = car.ai;
+  const foe = G.cars[0] === car ? G.cars[1] : G.cars[0];
+  const inp = { throttle: 1, steer: 0, boost: false, handbrake: false, jump: false, flip: false };
+
+  a.t -= dt;
+  const dxp = p.pos.x - car.pos.x, dzp = p.pos.z - car.pos.z;
+  const puckDist = hypot(dxp, dzp);
+
+  /* Toreck: nicht die Mitte, sondern das Eck, an dem der Gegner nicht steht */
+  const halb = CFG.goal.mouth / 2;
+  let zielZ = 0, bestWert = -1e9;
+  for (const kz of [-halb * 0.6, 0, halb * 0.6]) {
+    const dGegner = hypot(-HX + 30 - foe.pos.x, kz - foe.pos.z);
+    const wert = dGegner - Math.abs(kz - p.pos.z) * 0.55;
+    if (wert > bestWert) { bestWert = wert; zielZ = kz; }
+  }
+
+  /* Schusslinie: Puck -> Toreck */
+  let sx = -HX + 30 - p.pos.x, sz = zielZ - p.pos.z;
+  const sl = Math.max(1, hypot(sx, sz)); sx /= sl; sz /= sl;
+
+  /* Auf der Schussseite = hinter dem Puck (Richtung eigenes Tor), mit Hysterese */
+  const bx = car.pos.x - p.pos.x, bz = car.pos.z - p.pos.z;
+  const bl = Math.max(1, hypot(bx, bz));
+  const cosSeite = (bx * sx + bz * sz) / bl;
+  const hinten = a.hinten ? cosSeite < 0.15 : cosSeite < -0.25;
+  a.hinten = hinten;
+
+  if (a.t <= 0) {
+    a.t = 0.18;
+    const gefahr = p.pos.x > -120 && (p.vel.x > 120 || p.pos.x > 240);
+    a.bedrohung = gefahr;
+    const alt = a.mode;
+    a.mode = hinten ? (gefahr ? 'klaeren' : 'schuss') : (gefahr ? 'verteidigen' : 'umlaufen');
+    if ((a.mode === 'umlaufen' || a.mode === 'verteidigen')) {
+      if (alt !== a.mode) a.side = (car.pos.z - p.pos.z) >= 0 ? 1 : -1;   // einmal wählen, dann halten
+    } else a.side = 0;
+    a.noise = rand(-0.09, 0.09);
+  }
+
+  /* Stützpunkt: ein Auto-Abstand hinter dem Puck auf der Schusslinie */
+  const off = CFG.car.wallRadius + CFG.puck.r + 14;
+  let zielX = p.pos.x - sx * off, zielZiel = p.pos.z - sz * off;
+  const schussModus = a.mode === 'schuss' || a.mode === 'klaeren';
+  if (a.mode === 'umlaufen' || a.mode === 'verteidigen') {
+    /* Nicht quer über den Puck auf den Stützpunkt fahren — genau so hat er ihn
+       ins eigene Tor geschoben (gemessen: Streifabstand 83 bei Kontaktdistanz
+       80). Stattdessen kreist er in sicherem Abstand um den Puck, bis er
+       hinter ihm steht; der Winkel dreht pro Frame nur ein Stück weiter. */
+    const rOrbit = CFG.car.wallRadius + CFG.puck.r + 90;
+    const angAuto = Math.atan2(car.pos.z - p.pos.z, car.pos.x - p.pos.x);
+    const angStuetz = Math.atan2(zielZiel - p.pos.z, zielX - p.pos.x);
+    let dreh = wrapAngle(angStuetz - angAuto);
+    if (Math.abs(dreh) > 2.9) dreh = a.side * Math.abs(dreh);   // fast 180°: Seite entscheidet
+    const winkel = angAuto + clamp(dreh, -0.55, 0.55);
+    zielX = p.pos.x + Math.cos(winkel) * rOrbit;
+    zielZiel = p.pos.z + Math.sin(winkel) * rOrbit;
+  } else if (schussModus) {
+    /* Durch den Puck hindurch zielen — nicht davor abbremsen */
+    const lead = clamp(puckDist / (Math.max(400, car.speed) + 900), 0, 0.45);
+    zielX = p.pos.x + p.vel.x * lead + sx * 90;
+    zielZiel = p.pos.z + p.vel.z * lead + sz * 90;
+  }
+
+  const ang = Math.atan2(zielZiel - car.pos.z, zielX - car.pos.x) + a.noise;
+  const diff = wrapAngle(ang - car.heading);
+  const dZiel = hypot(zielX - car.pos.x, zielZiel - car.pos.z);
+  const aligned = Math.abs(diff) < 0.5;
+  const puckAmBoden = p.pos.y < 80;
+
+  /* Aerial: der einzige Fall, in dem Springen richtig ist */
+  if (!puckAmBoden && puckDist < 560 && car.boost > 6 &&
+      Math.abs(wrapAngle(Math.atan2(p.pos.z - car.pos.z, p.pos.x - car.pos.x) - car.heading)) < 0.9) {
+    if (car.grounded) inp.jump = true;
+    else if (car.flipReady && puckDist < 170) {
+      /* erst kurz vor dem Puck flippen: früh geflippt fällt der Auftrieb von
+         900 auf 605 (der Flip setzt vel.y neu) und der Bot kommt zu tief */
+      inp.jump = true;
+      inp.flipDir = { x: p.pos.x + sx * 60 - car.pos.x, y: p.pos.y - car.pos.y - 30, z: p.pos.z + sz * 60 - car.pos.z };
+    }
+    /* nur so lange heben, bis er auf Puckhöhe ist — sonst schießt er an die Decke */
+    if (!car.grounded && car.pos.y < p.pos.y - 5) inp.boost = true;
+    return inp;
+  }
+
+  inp.steer = clamp(diff * 2.4, -1, 1);
+
+  if (car.grounded) {
+    if (schussModus) {
+      inp.throttle = 1;                                      // durchrollen
+      if (aligned && car.boost > 6 && puckDist > 200) inp.boost = true;
+      /* Kurz vor dem Puck: Boden-Flip als Schuss (kein Sprung — der hebt zu hoch) */
+      if (puckAmBoden && aligned && puckDist < 175 && puckDist > 80 && car.dodgeCd <= 0) {
+        inp.flip = true;
+        inp.flipDir = { x: p.pos.x + sx * 40 - car.pos.x, y: 0, z: p.pos.z + sz * 40 - car.pos.z };
+      }
+    } else {
+      /* Umlaufen oder Tanken: sauber kurven, vor dem Ziel abbremsen */
+      if (Math.abs(diff) > 1.5 && car.speed > 520) inp.handbrake = true;
+      else if (car.speed > 640 && dZiel < 120 + car.speed * 0.35) inp.throttle = -1;
+      if (aligned && car.boost > 30 && dZiel > 520) inp.boost = true;
+    }
+  } else {
+    inp.throttle = 0;                                        // in der Luft hebt nur Boost
+  }
+
+  /* Tanken, wenn der Puck weit weg und ungefährlich ist (nie mitten im Angriff) */
+  if (!a.bedrohung && !schussModus && car.boost < 14 && puckDist > 420) {
+    let pad = null, pd = 1e9;
+    for (const q of G.pads) {
+      if (q.timer > 0) continue;
+      const d = hypot(q.x - car.pos.x, q.z - car.pos.z);
+      if (d < pd && d < 660) { pd = d; pad = q; }
+    }
+    if (pad) {
+      const ux = (pad.x - car.pos.x) / Math.max(1, pd), uz = (pad.z - car.pos.z) / Math.max(1, pd);
+      if (pd < puckDist && ux * dxp + uz * dzp < 0) {         // nur wenn der Puck nicht im Weg liegt
+        const diffP = wrapAngle(Math.atan2(pad.z - car.pos.z, pad.x - car.pos.x) + a.noise - car.heading);
+        inp.steer = clamp(diffP * 2.4, -1, 1);
+        inp.throttle = 1; inp.boost = false; inp.flip = false;
+        if (Math.abs(diffP) > 1.5 && car.speed > 520) inp.handbrake = true;
+      }
+    }
+  }
+  return inp;
+}
+
+/* ---------------------------------------------------------------
+   8) Match-Logik
+   --------------------------------------------------------------- */
+function startMatch() { newMatch(); }
+
+function scoreGoal(team) {
+  const m = G.match;
+  if (m.state !== 'play') return;
+  m[team]++;
+  m.scorer = team;
+  m.state = 'goal';
+  m.goalTimer = CFG.match.goalPause;
+  m.message = 'TOR!';
+  m.msgTimer = CFG.match.goalPause;
+  G.shake = 18;
+  Audio.goal();
+  fx({ kind: 'boom', x: G.puck.pos.x, y: G.puck.pos.y, z: G.puck.pos.z, n: 46, color: team });
+  for (let i = 0; i < 3; i++) fx({ kind: 'ring', x: G.puck.pos.x, y: G.puck.pos.y, z: G.puck.pos.z, n: 1, color: team });
+}
+
+function endMatch() {
+  const m = G.match;
+  m.state = 'ended';
+  m.message = m.blue === m.orange ? 'UNENTSCHIEDEN' : (m.blue > m.orange ? 'BLAU GEWINNT' : 'ORANGE GEWINNT');
+}
+
+function updateMatch(dt) {
+  const m = G.match;
+  if (m.msgTimer > 0) { m.msgTimer -= dt; if (m.msgTimer <= 0) m.message = ''; }
+
+  if (m.state === 'kickoff') {
+    m.kickoffTimer -= dt;
+    for (const c of G.cars) { c.vel.x = 0; c.vel.y = 0; c.vel.z = 0; c.boosting = false; }
+    if (m.kickoffTimer <= 0) { m.state = 'play'; m.message = ''; }
+  } else if (m.state === 'play') {
+    if (!m.overtime) {
+      m.clock -= dt;
+      if (m.clock <= 0) {
+        m.clock = 0;
+        if (m.blue === m.orange) {
+          m.overtime = true;
+          m.state = 'goal'; m.goalTimer = CFG.match.goalPause;
+          m.message = 'OVERTIME — GOLDEN GOAL'; m.msgTimer = 2.4;
+        } else endMatch();
+      }
+    }
+  } else if (m.state === 'goal') {
+    m.goalTimer -= dt;
+    if (m.goalTimer <= 0) {
+      if (m.overtime && m.scorer) endMatch();
+      else if (m.clock <= 0 && m.blue !== m.orange) endMatch();
+      else setupKickoff();
+    }
+  }
+}
+
+/* ---------------------------------------------------------------
+   9) Partikel (werden als GL-Punkte gezeichnet)
+   --------------------------------------------------------------- */
+function fx(o) {
+  for (let i = 0; i < o.n; i++) {
+    const ang = rand(0, TAU), sp = rand(60, o.kind === 'boom' ? 900 : 420);
+    const up = o.kind === 'boom' ? rand(-200, 700) : rand(40, 320);
+    const life = o.kind === 'boom' ? rand(0.5, 1.1) : rand(0.2, 0.5);
+    G.particles.push({
+      x: o.x, y: o.y, z: o.z,
+      vx: Math.cos(ang) * sp, vy: up, vz: Math.sin(ang) * sp,
+      life, max: life, color: o.color,
+      size: o.kind === 'boom' ? rand(6, 18) : rand(4, 10),
+      ring: o.kind === 'ring', t: 0
+    });
+  }
+  if (G.particles.length > 900) G.particles.splice(0, G.particles.length - 900);
+}
+
+function stepParticles(dt) {
+  for (let i = G.particles.length - 1; i >= 0; i--) {
+    const q = G.particles[i];
+    q.life -= dt; q.t += dt;
+    q.x += q.vx * dt; q.y += q.vy * dt; q.z += q.vz * dt;
+    q.vy -= 900 * dt;
+    q.vx *= 0.94; q.vz *= 0.94;
+    if (q.life <= 0) G.particles.splice(i, 1);
+  }
+  G.shake *= Math.max(0, 1 - 6 * dt);
+  G.hitFlash *= Math.max(0, 1 - 3.5 * dt);
+  G.slowmo = Math.max(0, G.slowmo - dt);
+}
+
+function update(dt) {
+  const m = G.match;
+  if (m.state !== 'menu' && !m.paused) {
+    for (const car of G.cars) {
+      let inp = NO_INPUT;
+      if (m.state === 'kickoff' || m.state === 'ended') {
+        if (car.jumpQueued) car.jumpQueued = false;
+      } else if (car.isBot) inp = botInput(car, dt);
+      else inp = humanInput(car);
+      stepCar(car, inp, dt);
+      car.jumpQueued = false;
+    }
+    collideCars(G.cars[0], G.cars[1]);
+    for (const car of G.cars) {
+      if (!car.dead) collidePuck(car, G.puck);
+      collectPads(car);
+    }
+    stepPuck(G.puck, dt);
+    for (const pad of G.pads) if (pad.timer > 0) pad.timer = Math.max(0, pad.timer - dt);
+    updateMatch(dt);
+  }
+  stepParticles(dt);
+  G.t += dt;
+
+  /* Boost-Dauerton folgt dem Simulationszustand */
+  const live = G.cars.length === 2;
+  Audio.setBoost(0, live && !m.paused && G.cars[0].boosting, live ? G.cars[0].speed : 0);
+  Audio.setBoost(1, live && !m.paused && G.cars[1].boosting, live ? G.cars[1].speed : 0);
+}
+
+/* ---------------------------------------------------------------
+   10) Klang — komplett synthetisiert (keine Audiodateien, keine Assets)
+   --------------------------------------------------------------- */
+const noiseCache = new WeakMap();
+function noiseBuffer(ctx) {
+  let buf = noiseCache.get(ctx);
+  if (buf) return buf;
+  const len = Math.floor(ctx.sampleRate);
+  buf = ctx.createBuffer(1, len, ctx.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+  noiseCache.set(ctx, buf);
+  return buf;
+}
+
+function sfxHit(ctx, dest, power, flip) {
+  const t = ctx.currentTime;
+  const p = clamp(power / 1800, 0.06, 1);
+
+  const n = ctx.createBufferSource();
+  n.buffer = noiseBuffer(ctx); n.loop = true;
+  const lp = ctx.createBiquadFilter();
+  lp.type = 'lowpass';
+  lp.frequency.setValueAtTime(2600 + p * 5200, t);
+  lp.frequency.exponentialRampToValueAtTime(420, t + 0.12);
+  const ng = ctx.createGain();
+  ng.gain.setValueAtTime(0.0001, t);
+  ng.gain.exponentialRampToValueAtTime(0.05 + 0.45 * p, t + 0.004);
+  ng.gain.exponentialRampToValueAtTime(0.0001, t + 0.09 + 0.13 * p);
+  n.connect(lp); lp.connect(ng); ng.connect(dest);
+  n.start(t); n.stop(t + 0.5);
+
+  const o = ctx.createOscillator();
+  o.type = flip ? 'square' : 'triangle';
+  o.frequency.setValueAtTime(300 + 320 * p, t);
+  o.frequency.exponentialRampToValueAtTime(85, t + 0.10);
+  const og = ctx.createGain();
+  og.gain.setValueAtTime(0.0001, t);
+  og.gain.exponentialRampToValueAtTime(0.04 + 0.22 * p, t + 0.005);
+  og.gain.exponentialRampToValueAtTime(0.0001, t + 0.12 + 0.12 * p);
+  o.connect(og); og.connect(dest);
+  o.start(t); o.stop(t + 0.4);
+
+  if (flip) {
+    const o2 = ctx.createOscillator();
+    o2.type = 'sawtooth';
+    o2.frequency.setValueAtTime(900, t);
+    o2.frequency.exponentialRampToValueAtTime(320, t + 0.18);
+    const g2 = ctx.createGain();
+    g2.gain.setValueAtTime(0.0001, t);
+    g2.gain.exponentialRampToValueAtTime(0.15, t + 0.006);
+    g2.gain.exponentialRampToValueAtTime(0.0001, t + 0.24);
+    o2.connect(g2); g2.connect(dest);
+    o2.start(t); o2.stop(t + 0.4);
+  }
+}
+
+function sfxGoal(ctx, dest) {
+  const t = ctx.currentTime;
+  const blips = [523.25, 659.25, 783.99, 1046.5];
+  blips.forEach((f, i) => {
+    const at = t + i * 0.11, last = i === blips.length - 1;
+    const o = ctx.createOscillator(); o.type = 'square'; o.frequency.value = f;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, at);
+    g.gain.exponentialRampToValueAtTime(0.14, at + 0.02);
+    g.gain.exponentialRampToValueAtTime(last ? 0.0001 : 0.05, at + (last ? 1.1 : 0.12));
+    o.connect(g); g.connect(dest);
+    o.start(at); o.stop(at + 1.2);
+  });
+  [523.25, 659.25, 783.99].forEach((f) => {
+    const o = ctx.createOscillator(); o.type = 'sawtooth'; o.frequency.value = f;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t + 0.33);
+    g.gain.exponentialRampToValueAtTime(0.07, t + 0.38);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 1.35);
+    o.connect(g); g.connect(dest);
+    o.start(t + 0.33); o.stop(t + 1.5);
+  });
+  const n = ctx.createBufferSource();
+  n.buffer = noiseBuffer(ctx); n.loop = true;
+  const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 1500; bp.Q.value = 0.7;
+  const ng = ctx.createGain();
+  ng.gain.setValueAtTime(0.0001, t);
+  ng.gain.linearRampToValueAtTime(0.13, t + 0.35);
+  ng.gain.exponentialRampToValueAtTime(0.0001, t + 1.5);
+  n.connect(bp); bp.connect(ng); ng.connect(dest);
+  n.start(t); n.stop(t + 1.6);
+}
+
+function sfxDemo(ctx, dest) {
+  const t = ctx.currentTime;
+  const n = ctx.createBufferSource();
+  n.buffer = noiseBuffer(ctx); n.loop = true;
+  const lp = ctx.createBiquadFilter();
+  lp.type = 'lowpass';
+  lp.frequency.setValueAtTime(3200, t);
+  lp.frequency.exponentialRampToValueAtTime(130, t + 0.6);
+  const g = ctx.createGain();
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(0.62, t + 0.008);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + 0.75);
+  n.connect(lp); lp.connect(g); g.connect(dest);
+  n.start(t); n.stop(t + 0.9);
+
+  const o = ctx.createOscillator(); o.type = 'sine';
+  o.frequency.setValueAtTime(150, t);
+  o.frequency.exponentialRampToValueAtTime(36, t + 0.5);
+  const og = ctx.createGain();
+  og.gain.setValueAtTime(0.0001, t);
+  og.gain.exponentialRampToValueAtTime(0.5, t + 0.02);
+  og.gain.exponentialRampToValueAtTime(0.0001, t + 0.6);
+  o.connect(og); og.connect(dest);
+  o.start(t); o.stop(t + 0.8);
+}
+
+function makeBoostVoice(ctx, dest) {
+  const gain = ctx.createGain();
+  gain.gain.value = 0;
+  gain.connect(dest);
+
+  const n = ctx.createBufferSource();
+  n.buffer = noiseBuffer(ctx); n.loop = true;
+  const band = ctx.createBiquadFilter();
+  band.type = 'bandpass'; band.frequency.value = 520; band.Q.value = 0.8;
+  n.connect(band); band.connect(gain);
+  n.start();
+
+  const rumble = ctx.createOscillator();
+  rumble.type = 'sawtooth'; rumble.frequency.value = 58;
+  const rl = ctx.createBiquadFilter(); rl.type = 'lowpass'; rl.frequency.value = 300;
+  const rg = ctx.createGain(); rg.gain.value = 0.5;
+  rumble.connect(rl); rl.connect(rg); rg.connect(gain);
+  rumble.start();
+
+  return { gain, band, rumble };
+}
+
+const Audio = {
+  ctx: null, master: null, voices: [], muted: false, unavailable: false, lastHit: -1, played: 0,
+  HIT_MIN_POWER: 90,
+  start() {
+    if (this.ctx || this.unavailable) return;
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) { this.unavailable = true; return; }
+      const ctx = new AC();
+      const master = ctx.createGain();
+      master.gain.value = this.muted ? 0 : 0.55;
+      master.connect(ctx.destination);
+      this.ctx = ctx; this.master = master;
+      this.voices = [makeBoostVoice(ctx, master), makeBoostVoice(ctx, master)];
+      if (ctx.state === 'suspended') ctx.resume();
+    } catch (e) { this.unavailable = true; }
+  },
+  resume() { if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume(); },
+  toggleMute() {
+    this.muted = !this.muted;
+    if (this.master) this.master.gain.value = this.muted ? 0 : 0.55;
+    return this.muted;
+  },
+  hit(power, flip) {
+    if (!this.ctx || power < this.HIT_MIN_POWER) return;
+    const t = this.ctx.currentTime;
+    const lockout = power > 400 ? 0.05 : power > 150 ? 0.10 : 0.28;
+    if (t - this.lastHit < lockout) return;
+    this.lastHit = t;
+    this.played++;
+    sfxHit(this.ctx, this.master, power, flip);
+  },
+  goal() { if (this.ctx) sfxGoal(this.ctx, this.master); },
+  demo() { if (this.ctx) sfxDemo(this.ctx, this.master); },
+  setBoost(i, on, speed) {
+    const v = this.voices[i];
+    if (!v || !this.ctx) return;
+    const t = this.ctx.currentTime;
+    const sp = clamp(speed / CFG.car.boostMax, 0, 1);
+    v.gain.gain.setTargetAtTime(on ? 0.09 + 0.12 * sp : 0, t, on ? 0.04 : 0.10);
+    v.band.frequency.setTargetAtTime(520 + sp * 900, t, 0.08);
+    v.rumble.frequency.setTargetAtTime(58 + sp * 62, t, 0.12);
+  }
+};
+
+/* ---------------------------------------------------------------
+   11) 3D-Rendering (WebGL2, handgeschrieben)
+   --------------------------------------------------------------- */
+const glCanvas = document.getElementById('gl');
+const hudCanvas = document.getElementById('hud');
+const hud = hudCanvas.getContext('2d');
+
+const MESH_VS = `#version 300 es
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in vec3 aNormal;
+uniform mat4 uModel, uViewProj;
+uniform mat3 uNormalMat;
+out vec3 vNormal;
+out vec3 vWorld;
+void main() {
+  vec4 wp = uModel * vec4(aPos, 1.0);
+  vWorld = wp.xyz;
+  vNormal = uNormalMat * aNormal;
+  gl_Position = uViewProj * wp;
+}`;
+
+const MESH_FS = `#version 300 es
+precision highp float;
+in vec3 vNormal;
+in vec3 vWorld;
+uniform vec3 uColor;
+uniform float uEmissive, uAlpha;
+uniform int uMode;
+uniform vec2 uField;
+out vec4 fragColor;
+float band(float v, float pitch) {
+  float g = max(fwidth(v / pitch), 1e-6);
+  return 1.0 - min(abs(fract(v / pitch - 0.5) - 0.5) / g, 1.0);
+}
+void main() {
+  if (uMode == 1) {                                  // Boden mit Linien
+    float line = max(band(vWorld.x, 100.0), band(vWorld.z, 100.0)) * 0.20;
+    float mid = 1.0 - min(abs(vWorld.x) / 5.0, 1.0);
+    float r = length(vWorld.xz);
+    float circ = (1.0 - min(abs(r - 132.0) / 5.0, 1.0)) + (1.0 - min(abs(r - 12.0) / 4.0, 1.0));
+    float border = max(1.0 - min((uField.x - abs(vWorld.x)) / 6.0, 1.0),
+                       1.0 - min((uField.y - abs(vWorld.z)) / 6.0, 1.0));
+    float ink = clamp(max(line, max(mid, max(circ, border))), 0.0, 1.0);
+    float side = smoothstep(-40.0, 40.0, vWorld.x);
+    vec3 base = mix(vec3(0.07, 0.12, 0.20), vec3(0.17, 0.11, 0.06), side);
+    fragColor = vec4(mix(base, vec3(0.74, 0.85, 0.98), ink * 0.5), 1.0);
+    return;
+  }
+  vec3 n = normalize(vNormal);
+  float diff = max(dot(n, normalize(vec3(0.35, 0.92, 0.25))), 0.0);
+  float rim = pow(1.0 - abs(n.y), 2.0) * 0.10;
+  vec3 col = uColor * (0.34 + 0.74 * diff + rim) + uColor * uEmissive;
+  fragColor = vec4(col, uAlpha);
+}`;
+
+const PT_VS = `#version 300 es
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in vec4 aColor;
+layout(location = 2) in float aSize;
+uniform mat4 uViewProj;
+uniform float uScale;
+out vec4 vColor;
+void main() {
+  vColor = aColor;
+  gl_Position = uViewProj * vec4(aPos, 1.0);
+  gl_PointSize = max(1.0, aSize * uScale / max(gl_Position.w, 1.0));
+}`;
+
+const PT_FS = `#version 300 es
+precision highp float;
+in vec4 vColor;
+out vec4 fragColor;
+void main() {
+  float a = smoothstep(0.5, 0.12, length(gl_PointCoord - vec2(0.5)));
+  if (a < 0.02) discard;
+  fragColor = vec4(vColor.rgb, vColor.a * a);
+}`;
+
+let GLR = null, progMesh = null, progPts = null;
+let uModel, uViewProj, uNormalMat, uColor, uEmissive, uAlpha, uMode, uField;
+let uPtViewProj, uPtScale;
+let MESH = {}, modelPosBuf = null, ptBuf = null;
+const PROJ = new Float32Array(16), VIEW = new Float32Array(16), VP = new Float32Array(16);
+const CAM = { mode: 0, pos: [-700, 420, 0], look: [0, 0, 0], fov: 62, ready: false };
+const warn = [];
+let crashed = false;
+
+function compile(type, src, name) {
+  const sh = GLR.createShader(type);
+  GLR.shaderSource(sh, src);
+  GLR.compileShader(sh);
+  if (!GLR.getShaderParameter(sh, GLR.COMPILE_STATUS)) {
+    warn.push(name + ': ' + GLR.getShaderInfoLog(sh));
+    return null;
+  }
+  return sh;
+}
+function program(vsSrc, fsSrc, name) {
+  const vs = compile(GLR.VERTEX_SHADER, vsSrc, name + ' VS');
+  const fs = compile(GLR.FRAGMENT_SHADER, fsSrc, name + ' FS');
+  if (!vs || !fs) return null;
+  const p = GLR.createProgram();
+  GLR.attachShader(p, vs); GLR.attachShader(p, fs); GLR.linkProgram(p);
+  if (!GLR.getProgramParameter(p, GLR.LINK_STATUS)) {
+    warn.push(name + ' Link: ' + GLR.getProgramInfoLog(p));
+    return null;
+  }
+  return p;
+}
+
+/* --- Geometrie --- */
+function meshFrom(pos, nor, idx) {
+  const m = {
+    buf: GLR.createBuffer(), nbuf: GLR.createBuffer(), ibuf: GLR.createBuffer(),
+    count: idx.length
+  };
+  GLR.bindBuffer(GLR.ARRAY_BUFFER, m.buf); GLR.bufferData(GLR.ARRAY_BUFFER, new Float32Array(pos), GLR.STATIC_DRAW);
+  GLR.bindBuffer(GLR.ARRAY_BUFFER, m.nbuf); GLR.bufferData(GLR.ARRAY_BUFFER, new Float32Array(nor), GLR.STATIC_DRAW);
+  GLR.bindBuffer(GLR.ELEMENT_ARRAY_BUFFER, m.ibuf);
+  GLR.bufferData(GLR.ELEMENT_ARRAY_BUFFER, new Uint16Array(idx), GLR.STATIC_DRAW);
+  return m;
+}
+function makeBox() {
+  const faces = [
+    { n: [0, 0, 1],  v: [[-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1]] },
+    { n: [0, 0, -1], v: [[1, -1, -1], [-1, -1, -1], [-1, 1, -1], [1, 1, -1]] },
+    { n: [1, 0, 0],  v: [[1, -1, 1], [1, -1, -1], [1, 1, -1], [1, 1, 1]] },
+    { n: [-1, 0, 0], v: [[-1, -1, -1], [-1, -1, 1], [-1, 1, 1], [-1, 1, -1]] },
+    { n: [0, 1, 0],  v: [[-1, 1, 1], [1, 1, 1], [1, 1, -1], [-1, 1, -1]] },
+    { n: [0, -1, 0], v: [[-1, -1, -1], [1, -1, -1], [1, -1, 1], [-1, -1, 1]] }
+  ];
+  const pos = [], nor = [], idx = [];
+  faces.forEach((f, fi) => {
+    f.v.forEach((v) => { pos.push(v[0], v[1], v[2]); nor.push(f.n[0], f.n[1], f.n[2]); });
+    const b = fi * 4;
+    idx.push(b, b + 1, b + 2, b, b + 2, b + 3);
+  });
+  return meshFrom(pos, nor, idx);
+}
+function makeCyl(seg) {
+  const pos = [], nor = [], idx = [];
+  for (let i = 0; i < seg; i++) {
+    const a0 = (i / seg) * TAU, a1 = ((i + 1) / seg) * TAU;
+    const x0 = Math.cos(a0), z0 = Math.sin(a0), x1 = Math.cos(a1), z1 = Math.sin(a1);
+    const b = pos.length / 3;
+    pos.push(x0, 0, z0, x1, 0, z1, x1, 1, z1, x0, 1, z0);
+    nor.push(x0, 0, z0, x1, 0, z1, x1, 0, z1, x0, 0, z0);
+    idx.push(b, b + 1, b + 2, b, b + 2, b + 3);
+  }
+  for (let i = 0; i < seg; i++) {                      // Deckel oben und unten
+    const a0 = (i / seg) * TAU, a1 = ((i + 1) / seg) * TAU;
+    const x0 = Math.cos(a0), z0 = Math.sin(a0), x1 = Math.cos(a1), z1 = Math.sin(a1);
+    let b = pos.length / 3;
+    pos.push(0, 1, 0, x0, 1, z0, x1, 1, z1);
+    nor.push(0, 1, 0, 0, 1, 0, 0, 1, 0);
+    idx.push(b, b + 1, b + 2);
+    b = pos.length / 3;
+    pos.push(0, 0, 0, x0, 0, z0, x1, 0, z1);
+    nor.push(0, -1, 0, 0, -1, 0, 0, -1, 0);
+    idx.push(b, b + 2, b + 1);
+  }
+  return meshFrom(pos, nor, idx);
+}
+function makePlane(normalY) {
+  const pos = [-1, 0, -1, -1, 0, 1, 1, 0, 1, 1, 0, -1];
+  const nor = new Array(12).fill(0);
+  const idx = normalY > 0 ? [0, 1, 2, 0, 2, 3] : [0, 3, 2, 0, 2, 1];
+  for (let i = 0; i < 4; i++) nor[i * 3 + 1] = normalY;
+  return meshFrom(pos, nor, idx);
+}
+function makePlaneZ() {
+  const pos = [-1, -1, 0, 1, -1, 0, 1, 1, 0, -1, 1, 0];
+  const nor = [0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1];
+  return meshFrom(pos, nor, [0, 1, 2, 0, 2, 3]);
+}
+
+function initGL() {
+  const tryCtx = (name, opts) => {
+    try { return glCanvas.getContext(name, opts); } catch (e) { return null; }
+  };
+  GLR = tryCtx('webgl2', { antialias: true, alpha: false, depth: true, powerPreference: 'high-performance' });
+  if (!GLR) {
+    /* zweiter Versuch ohne Kantenglättung (schwache GPUs) */
+    GLR = tryCtx('webgl2', { antialias: false });
+  }
+  if (!GLR) {
+    crashed = true;
+    warn.push('WebGL2 nicht verfügbar');
+    return false;
+  }
+  progMesh = program(MESH_VS, MESH_FS, 'mesh');
+  progPts = program(PT_VS, PT_FS, 'points');
+  if (!progMesh || !progPts) { crashed = true; return false; }
+
+  GLR.useProgram(progMesh);
+  uModel = GLR.getUniformLocation(progMesh, 'uModel');
+  uViewProj = GLR.getUniformLocation(progMesh, 'uViewProj');
+  uNormalMat = GLR.getUniformLocation(progMesh, 'uNormalMat');
+  uColor = GLR.getUniformLocation(progMesh, 'uColor');
+  uEmissive = GLR.getUniformLocation(progMesh, 'uEmissive');
+  uAlpha = GLR.getUniformLocation(progMesh, 'uAlpha');
+  uMode = GLR.getUniformLocation(progMesh, 'uMode');
+  uField = GLR.getUniformLocation(progMesh, 'uField');
+  GLR.uniform2f(uField, HX, HZ);
+
+  GLR.useProgram(progPts);
+  uPtViewProj = GLR.getUniformLocation(progPts, 'uViewProj');
+  uPtScale = GLR.getUniformLocation(progPts, 'uScale');
+
+  /* Hülle und Kisten sind einschichtig/geschlossen: Rückseiten wegblenden, damit
+     man aus der Übersicht in die Arena sieht (die Decke verschwindet von oben).
+     Der Zylinder ist doppelseitig, weil seine Wicklung nicht garantierbar ist. */
+  MESH.box = makeBox(); MESH.box.cull = true;
+  MESH.cyl = makeCyl(22); MESH.cyl.cull = false;
+  MESH.floor = makePlane(1); MESH.floor.cull = true;
+  MESH.ceil = makePlane(-1); MESH.ceil.cull = true;
+  MESH.wall = makePlaneZ(); MESH.wall.cull = true;
+  modelPosBuf = GLR.createBuffer();
+  ptBuf = GLR.createBuffer();
+  return true;
+}
+
+function bindMesh(m) {
+  GLR.bindBuffer(GLR.ARRAY_BUFFER, m.buf);
+  GLR.enableVertexAttribArray(0);
+  GLR.vertexAttribPointer(0, 3, GLR.FLOAT, false, 0, 0);
+  GLR.bindBuffer(GLR.ARRAY_BUFFER, m.nbuf);
+  GLR.enableVertexAttribArray(1);
+  GLR.vertexAttribPointer(1, 3, GLR.FLOAT, false, 0, 0);
+  GLR.bindBuffer(GLR.ELEMENT_ARRAY_BUFFER, m.ibuf);
+}
+
+/* Zeichnet ein Mesh: Position/Drehung/Skalierung, Farbe, optional Eigenleuchten */
+function draw(mesh, tx, ty, tz, yaw, pitch, roll, sx, sy, sz, color, emissive, alpha, mode) {
+  GLR.uniformMatrix4fv(uModel, false, m4compose(tx, ty, tz, yaw, pitch, roll, sx, sy, sz));
+  GLR.uniformMatrix3fv(uNormalMat, false, n3compose(yaw, pitch, roll, sx, sy, sz));
+  GLR.uniform3f(uColor, color[0], color[1], color[2]);
+  GLR.uniform1f(uEmissive, emissive || 0);
+  GLR.uniform1f(uAlpha, alpha === undefined ? 1 : alpha);
+  GLR.uniform1i(uMode, mode || 0);
+  if (mesh.cull === false) GLR.disable(GLR.CULL_FACE); else GLR.enable(GLR.CULL_FACE);
+  bindMesh(mesh);
+  GLR.drawElements(GLR.TRIANGLES, mesh.count, GLR.UNSIGNED_SHORT, 0);
+}
+
+const COL = {
+  blue: [0.18, 0.55, 1.0], orange: [1.0, 0.48, 0.18],
+  blueDark: [0.07, 0.2, 0.42], orangeDark: [0.42, 0.17, 0.06],
+  wallBlue: [0.09, 0.16, 0.28], wallOrange: [0.22, 0.14, 0.09], wallSide: [0.11, 0.13, 0.2],
+  ceil: [0.05, 0.07, 0.12],
+  puckTop: [0.22, 0.28, 0.4], puckSide: [0.78, 0.86, 1.0],
+  padBig: [1.0, 0.86, 0.35], padSmall: [0.5, 0.82, 1.0],
+  glass: [0.06, 0.09, 0.15], white: [0.88, 0.93, 1.0], black: [0.02, 0.02, 0.03]
+};
+
+function updateCamera(dt) {
+  const p = G.cars[0], b = G.puck;
+  let eye, look;
+  if (CAM.mode === 1) {                                  // Übersicht: quer über das Feld
+    eye = [0, 1700, HZ * 3.4];
+    look = [0, 20, 0];
+  } else {                                               // Verfolger (Ball-Cam)
+    const fx = Math.cos(p.heading), fz = Math.sin(p.heading);
+    const want = 520 + Math.min(240, p.speed * 0.12);
+    /* Abstand zur Bande in Blickrichtung begrenzen, damit die Kamera im Stadion bleibt */
+    const bx = -fx, bz = -fz;
+    let maxD = want;
+    if (bx < 0) maxD = Math.min(maxD, (p.pos.x + HX - 80) / -bx);
+    if (bx > 0) maxD = Math.min(maxD, (HX - p.pos.x - 80) / bx);
+    if (bz < 0) maxD = Math.min(maxD, (p.pos.z + HZ - 80) / -bz);
+    if (bz > 0) maxD = Math.min(maxD, (HZ - p.pos.z - 80) / bz);
+    maxD = clamp(maxD, 70, want);
+    const height = 285 * (0.55 + 0.45 * (maxD / want)) + p.pos.y * 0.45;
+    eye = [p.pos.x + bx * maxD, height, p.pos.z + bz * maxD];
+    look = [b.pos.x, b.pos.y + 40, b.pos.z];
+    eye[0] = clamp(eye[0], -HX + 70, HX + CFG.goal.depth - 70);
+    eye[2] = clamp(eye[2], -HZ + 70, HZ - 70);
+  }
+  if (!CAM.ready) { CAM.pos = eye.slice(); CAM.look = look.slice(); CAM.ready = true; }
+  const k = 1 - Math.exp(-8 * dt);
+  for (let i = 0; i < 3; i++) {
+    CAM.pos[i] += (eye[i] - CAM.pos[i]) * k;
+    CAM.look[i] += (look[i] - CAM.look[i]) * k;
+  }
+}
+
+function renderScene() {
+  if (!GLR || crashed) return;
+  const w = glCanvas.width, h = glCanvas.height;
+  GLR.viewport(0, 0, w, h);
+  GLR.clearColor(0.015, 0.02, 0.045, 1);
+  GLR.clear(GLR.COLOR_BUFFER_BIT | GLR.DEPTH_BUFFER_BIT);
+  GLR.enable(GLR.DEPTH_TEST);
+  GLR.depthFunc(GLR.LEQUAL);
+  GLR.depthMask(true);
+  GLR.enable(GLR.CULL_FACE);
+  GLR.cullFace(GLR.BACK);
+  GLR.frontFace(GLR.CCW);
+  GLR.disable(GLR.BLEND);
+
+  m4perspective(PROJ, CAM.fov * Math.PI / 180, Math.max(0.2, w / h), 6, 14000);
+  m4lookAt(VIEW, CAM.pos[0], CAM.pos[1], CAM.pos[2], CAM.look[0], CAM.look[1], CAM.look[2]);
+  m4mul(VP, PROJ, VIEW);
+
+  GLR.useProgram(progMesh);
+  GLR.uniformMatrix4fv(uViewProj, false, VP);
+  GLR.uniform2f(uField, HX, HZ);
+  /* Boden */
+  draw(MESH.floor, 0, 0, 0, 0, 0, 0, HX, 1, HZ, COL.white, 0, 1, 1);
+  /* Decke (von innen sichtbar, von oben durchsichtig, weil Rückseite) */
+  draw(MESH.ceil, 0, CFG.arena.ceil, 0, 0, 0, 0, HX, 1, HZ, COL.ceil, 0, 1, 0);
+
+  const wallB = COL.wallBlue, wallO = COL.wallOrange;
+  const hw = CFG.arena.wall;
+  /* Stirnwände mit Torausschnitt (Blaue Seite bei -x, orange bei +x) */
+  for (const side of [-1, 1]) {
+    const col = side < 0 ? wallB : wallO;
+    const yaw = side < 0 ? Math.PI / 2 : -Math.PI / 2;
+    const rest = (FIELD.d - CFG.goal.mouth) / 2 / 2;         // halbe Restbreite
+    const cz = (CFG.goal.mouth + FIELD.d) / 4;               // Mitte der Reststücke
+    for (const s of [-1, 1]) {
+      draw(MESH.wall, side * HX, hw / 2, s * cz, yaw, 0, 0, rest, hw / 2, 1, col, 0);
+    }
+    /* Stück über der Torlatte */
+    const oben = (hw - CFG.goal.bar) / 2;
+    draw(MESH.wall, side * HX, CFG.goal.bar + oben, 0, yaw, 0, 0,
+         CFG.goal.mouth / 2, oben, 1, col, 0, 0.85);
+    /* Torraum: Rückwand + Seitenwände */
+    const gx = side * (HX + CFG.goal.depth);
+    draw(MESH.wall, gx, hw / 2, 0, side < 0 ? Math.PI / 2 : -Math.PI / 2, 0, 0,
+         CFG.goal.mouth / 2, hw / 2, 1, side < 0 ? COL.blueDark : COL.orangeDark, side < 0 ? 0.5 : 0.5);
+    for (const s of [-1, 1]) {
+      /* Seitenwände des Torraums liegen quer zur Öffnung: Normale zeigt zur Torachse */
+      draw(MESH.wall, side * (HX + CFG.goal.depth / 2), hw / 2, s * CFG.goal.mouth / 2,
+           s < 0 ? 0 : Math.PI, 0, 0, CFG.goal.depth / 2, hw / 2, 1,
+           side < 0 ? COL.blueDark : COL.orangeDark, 0.3);
+    }
+  }
+  /* Seitenwände */
+  for (const s of [-1, 1]) {
+    draw(MESH.wall, 0, hw / 2, s * HZ, s < 0 ? 0 : Math.PI, 0, 0, HX, hw / 2, 1, COL.wallSide, 0);
+  }
+  /* Torbalken (Teamfarben, leicht leuchtend) */
+  const bar = CFG.goal.bar;
+  for (const side of [-1, 1]) {
+    const c = side < 0 ? COL.blue : COL.orange;
+    draw(MESH.box, side * HX, bar, 0, 0, 0, 0, 5, 6, CFG.goal.mouth / 2 + 6, c, 0.75);
+    for (const s of [-1, 1]) {
+      draw(MESH.box, side * HX, bar / 2, s * CFG.goal.mouth / 2, 0, 0, 0, 5, bar / 2, 5, c, 0.75);
+    }
+  }
+
+  /* Boost-Pads */
+  for (const pad of G.pads) {
+    const ready = pad.timer <= 0;
+    const r = pad.big ? 30 : 20;
+    const col = pad.big ? COL.padBig : COL.padSmall;
+    draw(MESH.cyl, pad.x, 1, pad.z, 0, 0, 0, r, ready ? 5 : 2, r,
+         ready ? col : [col[0] * 0.35, col[1] * 0.35, col[2] * 0.35], ready ? 0.55 : 0.05);
+  }
+
+  /* Schatten (transparent, ohne Tiefenschreiben) */
+  GLR.enable(GLR.BLEND);
+  GLR.blendFunc(GLR.SRC_ALPHA, GLR.ONE_MINUS_SRC_ALPHA);
+  GLR.depthMask(false);
+  for (const car of G.cars) {
+    if (car.dead) continue;
+    const f = clamp(1 - car.pos.y / 420, 0.25, 1);
+    draw(MESH.cyl, car.pos.x, 1.2, car.pos.z, 0, 0, 0, CFG.car.len * 0.55 * f, 0.6, CFG.car.wid * 0.62 * f,
+         COL.black, 0, 0.42 * f);
+  }
+  const pf = clamp(1 - (G.puck.pos.y - CFG.puck.r) / 520, 0.2, 1);
+  draw(MESH.cyl, G.puck.pos.x, 1.0, G.puck.pos.z, 0, 0, 0, CFG.puck.r * pf, 0.6, CFG.puck.r * pf,
+       COL.black, 0, 0.4 * pf);
+  GLR.depthMask(true);
+  GLR.disable(GLR.BLEND);
+
+  /* Autos */
+  for (const car of G.cars) {
+    if (car.dead) continue;
+    drawCar(car);
+  }
+  drawPuck();
+  drawPoints();
+}
+
+function drawCar(car) {
+  const yaw = -car.heading;                       // Modell dreht gegen die Spielrichtung
+  const fw = car.flipTimer > 0 ? car.tilt * TAU * 0.9 * (car.flipTimer / CFG.car.dodgeTime) : 0;
+  const tilt = car.flipLateral ? 0 : fw;          // Nicken beim Vorwärts-/Rückwärtsflip
+  const roll = car.flipLateral ? fw * 0.6 : car.roll3;
+  const base = COL[car.team];
+  const bx = car.pos.x, by = car.pos.y, bz = car.pos.z;
+  const L = CFG.car.len / 2, W = CFG.car.wid / 2, H = CFG.car.hei;
+
+  /* Boost-Flamme */
+  if (car.boosting) {
+    const f = rand(18, 42);
+    draw(MESH.cyl, bx - Math.cos(car.heading) * (L + f / 2), by + H * 0.5, bz - Math.sin(car.heading) * (L + f / 2),
+         yaw, Math.PI / 2, 0, W * 0.45, f, W * 0.45, [1, 0.75, 0.3], 1.3);
+  }
+  /* Räder: an den vier Ecken, in der lokalen Achse des Autos */
+  const ch = Math.cos(car.heading), sh = Math.sin(car.heading);
+  for (const sl of [-1, 1]) for (const sw of [-1, 1]) {
+    const lx = sl * L * 0.6, lz = sw * W * 1.02;
+    draw(MESH.box, bx + lx * ch - lz * sh, by + 9, bz + lx * sh + lz * ch,
+         yaw, 0, 0, 8, 9, 5, COL.black, 0);
+  }
+  /* Karosserie */
+  draw(MESH.box, bx, by + H * 0.5, bz, yaw, tilt, roll, L, CFG.car.hei * 0.34, W, base, 0.05);
+  /* Cockpit */
+  draw(MESH.box, bx, by + H * 0.82, bz, yaw, tilt, roll, L * 0.42, CFG.car.hei * 0.22, W * 0.78, COL.glass, 0.05);
+  /* Frontspoiler */
+  draw(MESH.box, bx + ch * L * 0.95, by + H * 0.45,
+       bz + sh * L * 0.95, yaw, tilt, roll, 4, H * 0.3, W * 0.95, COL.white, 0.1);
+  /* Spawn-Schutz */
+  if (car.protect > 0) {
+    const a = 0.25 + 0.2 * Math.sin(G.t * 16);
+    draw(MESH.cyl, bx, by + 2, bz, 0, 0, 0, CFG.car.wallRadius + 14, 2, CFG.car.wallRadius + 14, COL.white, 1.1 * a, 0.45);
+  }
+}
+
+function drawPuck() {
+  const p = G.puck;
+  const r = CFG.puck.r;
+  /* Der Puck liegt als flache Scheibe auf dem Boden, wenn die Kugel aufliegt:
+     die Kollision ist eine Kugel, die Optik eine Scheibe mit hellem Rand. */
+  const base = p.pos.y - r * 0.9;
+  const h = r * 0.62;
+  draw(MESH.cyl, p.pos.x, base, p.pos.z, p.roll, 0, 0, r * 0.97, h, r * 0.97, COL.puckTop, 0, 1);
+  draw(MESH.cyl, p.pos.x, base + h - 1, p.pos.z, p.roll, 0, 0, r * 1.02, r * 0.16, r * 1.02, COL.puckSide, 0.4, 1);
+  /* Speichen auf der Oberseite zeigen die Drehung */
+  for (let i = 0; i < 4; i++) {
+    const a = p.roll + i * Math.PI / 2;
+    draw(MESH.box, p.pos.x + Math.cos(a) * r * 0.5, base + h + 1, p.pos.z + Math.sin(a) * r * 0.5,
+         -a, 0, 0, r * 0.42, 1.6, 3.4, COL.puckSide, 0.2);
+  }
+}
+
+const ptData = new Float32Array(900 * 8);
+function drawPoints() {
+  if (!G.particles.length) return;
+  let n = 0;
+  for (const q of G.particles) {
+    const a = clamp(q.life / q.max, 0, 1);
+    const c = particleColor(q.color);
+    const size = q.ring ? 40 + q.t * 700 : q.size;
+    ptData[n * 8 + 0] = q.x; ptData[n * 8 + 1] = q.y; ptData[n * 8 + 2] = q.z;
+    ptData[n * 8 + 3] = c[0]; ptData[n * 8 + 4] = c[1]; ptData[n * 8 + 5] = c[2];
+    ptData[n * 8 + 6] = a;
+    ptData[n * 8 + 7] = size;
+    n++;
+    if (n >= 900) break;
+  }
+  GLR.useProgram(progPts);
+  GLR.uniformMatrix4fv(uPtViewProj, false, VP);
+  GLR.uniform1f(uPtScale, (glCanvas.height * 0.5) / Math.tan((CAM.fov * Math.PI / 180) / 2));
+  GLR.bindBuffer(GLR.ARRAY_BUFFER, ptBuf);
+  GLR.bufferData(GLR.ARRAY_BUFFER, ptData.subarray(0, n * 8), GLR.DYNAMIC_DRAW);
+  GLR.enableVertexAttribArray(0); GLR.vertexAttribPointer(0, 3, GLR.FLOAT, false, 32, 0);
+  GLR.enableVertexAttribArray(1); GLR.vertexAttribPointer(1, 4, GLR.FLOAT, false, 32, 12);
+  GLR.enableVertexAttribArray(2); GLR.vertexAttribPointer(2, 1, GLR.FLOAT, false, 32, 28);
+  GLR.enable(GLR.BLEND);
+  GLR.blendFunc(GLR.SRC_ALPHA, GLR.ONE_MINUS_SRC_ALPHA);
+  GLR.depthMask(false);
+  GLR.drawArrays(GLR.POINTS, 0, n);
+  GLR.depthMask(true);
+  GLR.disable(GLR.BLEND);
+}
+
+function particleColor(c) {
+  if (c === 'blue') return [0.5, 0.75, 1.0];
+  if (c === 'orange') return [1.0, 0.7, 0.5];
+  if (c === 'puck') return [0.86, 0.92, 1.0];
+  if (c === 'flip') return [1.0, 0.94, 0.63];
+  if (c === 'big') return [1.0, 0.88, 0.4];
+  return [1.0, 1.0, 1.0];
+}
+
+/* ---------------------------------------------------------------
+   12) HUD (2D-Ebene über der 3D-Szene) — aus der 2D-Fassung übernommen
+   --------------------------------------------------------------- */
+let view = { w: 0, h: 0, dpr: 1 };
+
+function resize() {
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const w = glCanvas.clientWidth || window.innerWidth;
+  const h = glCanvas.clientHeight || window.innerHeight;
+  for (const c of [glCanvas, hudCanvas]) {
+    c.width = Math.round(w * dpr); c.height = Math.round(h * dpr);
+  }
+  view = { w, h, dpr };
+  if (GLR) GLR.viewport(0, 0, glCanvas.width, glCanvas.height);
+}
+
+function roundRect(x, y, w, h, r) {
+  hud.beginPath();
+  hud.moveTo(x + r, y);
+  hud.arcTo(x + w, y, x + w, y + h, r);
+  hud.arcTo(x + w, y + h, x, y + h, r);
+  hud.arcTo(x, y + h, x, y, r);
+  hud.arcTo(x, y, x + w, y, r);
+  hud.closePath();
+}
+
+function fmtTime(s) {
+  s = Math.max(0, Math.ceil(s));
+  return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+}
+
+function drawBoost(x, y, w, h, car, label, u, align) {
+  const cap = CFG.car.boostCap;
+  const frac = clamp(car.boost / cap, 0, 1);
+  hud.save();
+  hud.textAlign = align;
+  hud.font = `700 ${13 * u}px "Segoe UI", system-ui, sans-serif`;
+  hud.fillStyle = 'rgba(200,220,245,0.65)';
+  hud.fillText(label + '   ' + Math.round(car.boost), x, y - 22 * u);
+
+  const dir = Math.sign(w) || 1;
+  const x0 = Math.min(x, x + w), ww = Math.abs(w);
+  hud.fillStyle = 'rgba(8,14,26,0.75)';
+  roundRect(x0, y, ww, h, h / 2); hud.fill();
+  hud.strokeStyle = 'rgba(120,160,220,0.3)'; hud.lineWidth = 1.5; hud.stroke();
+
+  const fw = ww * frac;
+  const fx0 = dir > 0 ? x0 : x0 + ww - fw;
+  const g = hud.createLinearGradient(x0, 0, x0 + ww, 0);
+  g.addColorStop(0, car.team === 'blue' ? '#2f8cff' : '#ff7a2f');
+  g.addColorStop(1, car.team === 'blue' ? '#9fd4ff' : '#ffd0a0');
+  hud.fillStyle = g;
+  if (fw > 1) { roundRect(fx0, y, fw, h, h / 2); hud.fill(); }
+  hud.restore();
+}
+
+function overlay(title, lines, u) {
+  hud.save();
+  hud.fillStyle = 'rgba(3,5,11,0.78)';
+  hud.fillRect(0, 0, view.w, view.h);
+  hud.textAlign = 'center';
+  hud.textBaseline = 'middle';
+  hud.shadowColor = 'rgba(120,190,255,0.8)'; hud.shadowBlur = 26;
+  hud.fillStyle = '#ffffff';
+  hud.font = `800 ${50 * u}px "Segoe UI", system-ui, sans-serif`;
+  hud.fillText(title, view.w / 2, view.h * 0.24);
+  hud.shadowBlur = 0;
+  hud.font = `500 ${16 * u}px "Segoe UI", system-ui, sans-serif`;
+  let yy = view.h * 0.38;
+  for (const line of lines) {
+    hud.fillStyle = line.startsWith('⚡') || line.startsWith('💥') ? 'rgba(255,224,102,0.85)' : 'rgba(215,232,255,0.82)';
+    hud.fillText(line, view.w / 2, yy);
+    yy += 25 * u;
+  }
+  hud.restore();
+}
+
+function drawHUD() {
+  const W = view.w, H = view.h;
+  const u = clamp(W / 1500, 0.72, 1.35);
+  const cx = W / 2;
+  const m = G.match;
+  hud.setTransform(view.dpr, 0, 0, view.dpr, 0, 0);
+  hud.clearRect(0, 0, W, H);
+  hud.save();
+  hud.textBaseline = 'middle';
+
+  /* Scoreboard */
+  const bw = 460 * u, bh = 62 * u, by = 14 * u;
+  hud.fillStyle = 'rgba(8,14,26,0.82)';
+  roundRect(cx - bw / 2, by, bw, bh, 14 * u); hud.fill();
+  hud.strokeStyle = 'rgba(120,160,220,0.35)'; hud.lineWidth = 1.5; hud.stroke();
+
+  hud.font = `700 ${30 * u}px "Segoe UI", system-ui, sans-serif`;
+  hud.textAlign = 'left'; hud.fillStyle = '#2f8cff';
+  hud.fillText('BLAU', cx - bw / 2 + 18 * u, by + bh / 2);
+  hud.textAlign = 'right'; hud.fillStyle = '#ff7a2f';
+  hud.fillText('ORANGE', cx + bw / 2 - 18 * u, by + bh / 2);
+  hud.textAlign = 'center'; hud.fillStyle = '#eaf3ff';
+  hud.font = `800 ${32 * u}px "Segoe UI", system-ui, sans-serif`;
+  hud.fillText(`${m.blue}  ${fmtTime(m.clock)}  ${m.orange}`, cx, by + bh / 2 + 1);
+  if (m.overtime) {
+    hud.font = `700 ${12 * u}px "Segoe UI", system-ui, sans-serif`;
+    hud.fillStyle = '#ffe066';
+    hud.fillText('OVERTIME', cx, by + bh + 12 * u);
+  }
+
+  drawBoost(60 * u, H - 66 * u, 300 * u, 20 * u, G.cars[0], 'BLAU  (WASD)', u, 'left');
+  drawBoost(W - 60 * u, H - 66 * u, -300 * u, 20 * u, G.cars[1], 'ORANGE  (BOT)', u, 'right');
+
+  hud.font = `700 ${16 * u}px "Segoe UI", system-ui, sans-serif`;
+  hud.fillStyle = 'rgba(220,235,255,0.75)';
+  hud.textAlign = 'left';
+  hud.fillText(Math.round(G.cars[0].speed * 0.12) + ' km/h', 60 * u, H - 92 * u);
+  hud.textAlign = 'right';
+  hud.fillText(Math.round(G.cars[1].speed * 0.12) + ' km/h', W - 60 * u, H - 92 * u);
+  hud.textAlign = 'center';
+  hud.font = `600 ${12 * u}px "Segoe UI", system-ui, sans-serif`;
+  hud.fillStyle = 'rgba(190,215,245,0.5)';
+  hud.fillText(CAM.mode === 1 ? 'KAMERA: ÜBERSICHT  (C)' : 'KAMERA: BALL-CAM  (C)', cx, H - 26 * u);
+
+  /* Mitte */
+  let big = '', sub = '';
+  if (m.state === 'kickoff') {
+    big = String(Math.max(1, Math.ceil(m.kickoffTimer)));
+    sub = m.message || 'Anpfiff in …';
+  } else if (m.message) big = m.message;
+  if (big) {
+    hud.textAlign = 'center';
+    hud.font = `800 ${64 * u}px "Segoe UI", system-ui, sans-serif`;
+    hud.shadowColor = 'rgba(120,190,255,0.9)'; hud.shadowBlur = 24;
+    hud.fillStyle = '#ffffff';
+    hud.fillText(big, cx, H * 0.38);
+    hud.shadowBlur = 0;
+  }
+  if (sub) {
+    hud.textAlign = 'center';
+    hud.font = `600 ${15 * u}px "Segoe UI", system-ui, sans-serif`;
+    hud.fillStyle = 'rgba(210,230,255,0.62)';
+    hud.fillText(sub, cx, H * 0.38 + 46 * u);
+  }
+
+  if (m.state === 'menu') overlay('PUCK ROCKET 3D', [
+    '1 gegen 1: du (BLAU) gegen Bot (ORANGE)',
+    'Ziel: Puck in das ORANGE Tor drücken',
+    '',
+    'W / S    Gas & Bremse / Rückwärts',
+    'A / D    Lenken   (in der Luft: Drehen)',
+    'LEER     Sprung — ein zweites Mal = Flip',
+    '         (Flip trifft den Puck am härtesten)',
+    'SHIFT    Boost — hebt dich in der Luft: AERIAL',
+    'STRG     Handbremse / Drift',
+    'C        Kamera (Ball-Cam / Übersicht)',
+    'P Pause  ·  R Revanche  ·  M Ton',
+    '',
+    '⚡ Große Pads = 100 Boost   ·   kleine Pads = 12 Boost',
+    '💥 Rammstoß mit Supersonic-Tempo = Demolition',
+    '',
+    'ENTER oder LEER — Anpfiff'
+  ], u);
+  else if (m.state === 'ended') overlay(m.message, [
+    `Endstand:  BLAU ${m.blue} : ${m.orange} ORANGE`,
+    `Demolitions:  ${G.cars[0].demos} : ${G.cars[1].demos}`,
+    '', 'R oder LEER — Revanche'
+  ], u);
+  else if (m.paused) overlay('PAUSE', ['ESC oder P — weiter    ·    R — Revanche'], u);
+
+  hud.restore();
+}
+
+/* ---------------------------------------------------------------
+   13) Eingabe & Loop
+   --------------------------------------------------------------- */
+const keys = new Set();
+
+function humanInput(car) {
+  const up = keys.has('w'), down = keys.has('s');
+  const left = keys.has('a'), right = keys.has('d');
+  return {
+    throttle: (up ? 1 : 0) - (down ? 1 : 0),
+    steer: (right ? 1 : 0) - (left ? 1 : 0),
+    boost: keys.has('shift'),
+    handbrake: keys.has('control'),
+    jump: car.jumpQueued
+  };
+}
+
+function keyName(e) { return e.key.toLowerCase(); }
+
+window.addEventListener('keydown', (e) => {
+  Audio.start();
+  const k = keyName(e);
+  if ([' ', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright', 'shift', 'tab'].includes(k)) e.preventDefault();
+  const m = G.match;
+
+  if (!e.repeat) {
+    if (k === ' ') {
+      if (m.state === 'menu' || m.state === 'ended') { startMatch(); keys.clear(); return; }
+      G.cars[0].jumpQueued = true;
+    }
+    if (k === 'enter' && (m.state === 'menu' || m.state === 'ended')) { startMatch(); keys.clear(); return; }
+    if (k === 'p' || k === 'escape') {
+      if (m.state === 'play' || m.state === 'kickoff' || m.state === 'goal') m.paused = !m.paused;
+      keys.clear();
+      return;
+    }
+    if (k === 'r') { startMatch(); keys.clear(); return; }
+    if (k === 'c') { CAM.mode = CAM.mode === 0 ? 1 : 0; CAM.ready = false; return; }
+    if (k === 'm') {
+      G.match.message = Audio.toggleMute() ? 'TON AUS' : 'TON AN';
+      G.match.msgTimer = 1.0;
+      return;
+    }
+  }
+  keys.add(k);
+});
+
+window.addEventListener('keyup', (e) => keys.delete(keyName(e)));
+window.addEventListener('blur', () => keys.clear());
+window.addEventListener('resize', resize);
+window.addEventListener('pointerdown', () => Audio.start());
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    if (G.match.state === 'play') G.match.paused = true;
+    Audio.setBoost(0, false, 0);
+    Audio.setBoost(1, false, 0);
+  } else Audio.resume();
+});
+
+let acc = 0, last = performance.now();
+const STEP = 1 / 120;
+
+function frame(now) {
+  let dt = (now - last) / 1000;
+  last = now;
+  if (!isFinite(dt) || dt < 0) dt = 0;
+  dt = Math.min(dt, 0.1);
+  if (G.slowmo > 0) dt *= 0.35;
+
+  acc += dt;
+  let guard = 0;
+  while (acc >= STEP && guard++ < 16) { update(STEP); acc -= STEP; }
+  updateCamera(Math.min(dt, 0.05));
+  renderScene();
+  drawHUD();
+  requestAnimationFrame(frame);
+}
+
+/* Debug-Hooks (auch für automatisierte Prüfung im Browser) */
+window.GAME = {
+  G, CFG, CAM, Audio, gl: null,
+  get glError() { return GLR ? GLR.getError() : -1; },
+  get warnings() { return warn; },
+  get renderer() { return GLR ? GLR.getParameter(GLR.RENDERER) + ' | ' + GLR.getParameter(GLR.VERSION) : 'kein WebGL2'; },
+  startMatch, update,
+  /* erzwingt einen Frame im selben Aufruf — nötig, um den GL-Puffer auszulesen */
+  renderNow() { updateCamera(1 / 60); renderScene(); },
+  sfx: { hit: sfxHit, goal: sfxGoal, demo: sfxDemo, boostVoice: makeBoostVoice },
+  simulate(seconds, step = 1 / 120) { let t = 0; while (t < seconds) { update(step); t += step; } },
+  hold(k) { window.dispatchEvent(new KeyboardEvent('keydown', { key: k })); },
+  release(k) { window.dispatchEvent(new KeyboardEvent('keyup', { key: k })); },
+  /* Weltpunkt -> Bildschirmkoordinaten (für Prüfungen der Kamera) */
+  project(x, y, z) {
+    const v = VP;
+    const cw = v[3] * x + v[7] * y + v[11] * z + v[15];
+    const cx = v[0] * x + v[4] * y + v[8] * z + v[12];
+    const cy = v[1] * x + v[5] * y + v[9] * z + v[13];
+    const cd = v[2] * x + v[6] * y + v[10] * z + v[14];
+    if (cw <= 0) return { behind: true };
+    return { x: (cx / cw * 0.5 + 0.5) * view.w, y: (1 - (cy / cw * 0.5 + 0.5)) * view.h, ndc: [cx / cw, cy / cw, cd / cw] };
+  }
+};
+
+/* Start */
+function boot() {
+  resize();
+  if (!initGL()) {
+    document.getElementById('fail').style.display = 'grid';
+    document.getElementById('fail').innerHTML =
+      'WebGL2 ist in diesem Browser nicht verfügbar — die 3D-Fassung kann hier nicht starten.' +
+      '<br><br>Wenn möglich, die 2D-Fassung öffnen: <a style="color:#7fb8ff" href="2d-version/index.html">2d-version/index.html</a>' +
+      '<br><br><span style="opacity:.6">Details: ' + (warn.join(' | ') || 'unbekannt') + '</span>';
+    console.error('PUCK ROCKET 3D: Start fehlgeschlagen ->', warn.join(' | '));
+    return;
+  }
+  window.GAME.gl = GLR;
+  if (warn.length) console.warn('PUCK ROCKET 3D Hinweise:', warn.join(' | '));
+  newMatch();
+  G.match.state = 'menu';
+  requestAnimationFrame(frame);
+}
+
+/* WebGL-Start prüfen, bevor der Rest läuft */
+try {
+  boot();
+} catch (err) {
+  console.error('PUCK ROCKET 3D Startfehler:', err);
+  document.getElementById('fail').style.display = 'grid';
+  document.getElementById('fail').textContent = 'Startfehler: ' + err.message;
+}
+</script>
+</body>
+</html>
